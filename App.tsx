@@ -6,7 +6,8 @@ import {
   SlidersHorizontal, Scissors, Combine, Zap, ArrowLeft,
   ChevronRight, FilePlus, PlusCircle, Sun, Moon, Languages, Search,
   Copy, ExternalLink, Sparkles, LayoutDashboard, ShieldCheck, ZapIcon,
-  Lock, Heart, Code, Monitor, FileType, Share2, BrainCircuit
+  Lock, Heart, Code, Monitor, FileType, Share2, BrainCircuit,
+  Linkedin, Facebook, Mail, MessageCircle
 } from 'lucide-react';
 import JSZip from 'jszip';
 import { PDFDocument, PageSizes } from 'pdf-lib';
@@ -86,7 +87,11 @@ const translations = {
     high: 'হাই',
     creatingPdf: 'পিডিএফ তৈরি হচ্ছে...',
     shareDenied: 'সিকিউরিটি পলিসির কারণে সরাসরি অ্যাপ ওপেন করা সম্ভব হয়নি। ফাইলটি ডাউনলোড করুন।',
-    ocrTip: 'টিপস: ঝকঝকে স্ক্যান করা পিডিএফ ব্যবহার করলে নির্ভুল টেক্সট পাওয়া যায়।'
+    ocrTip: 'টিপস: ঝকঝকে স্ক্যান করা পিডিএফ ব্যবহার করলে নির্ভুল টেক্সট পাওয়া যায়।',
+    navTitle: 'নেভিগেশন',
+    connectTitle: 'কানেক্ট ও সাপোর্ট',
+    sendSuggestion: 'পরামর্শ পাঠান',
+    devWith: 'DEVELOPED WITH ❤️ IN BD'
   },
   en: {
     title: 'PDF Nova',
@@ -156,7 +161,11 @@ const translations = {
     high: 'High',
     creatingPdf: 'Creating PDF...',
     shareDenied: 'Could not open app due to security policy. Please use Download instead.',
-    ocrTip: 'Tip: Use high-quality scanned PDFs for best accuracy.'
+    ocrTip: 'Tip: Use high-quality scanned PDFs for best accuracy.',
+    navTitle: 'NAVIGATION',
+    connectTitle: 'CONNECT & SUPPORT',
+    sendSuggestion: 'Send Suggestion',
+    devWith: 'DEVELOPED WITH ❤️ IN BD'
   }
 };
 
@@ -974,35 +983,68 @@ const App: React.FC = () => {
         )}
       </main>
 
-      <footer className="mt-10 border-t dark:border-slate-800 py-10 relative overflow-hidden bg-white/50 dark:bg-slate-900/50 glass">
-        <div className="max-w-7xl mx-auto px-6 grid grid-cols-1 md:grid-cols-3 gap-8 items-center">
-          <div className="space-y-4">
-            <div className="flex items-center gap-3">
-              <div className="bg-slate-900 dark:bg-white p-2 rounded-xl shadow-lg cursor-pointer" onClick={() => navigateTo('HOME')}>
-                <FileText className="text-white dark:text-slate-900 w-5 h-5" />
+      <footer className="mt-12 border-t dark:border-slate-800 py-10 relative overflow-hidden bg-white/50 dark:bg-slate-900/50 glass">
+        <div className="max-w-7xl mx-auto px-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-12">
+            {/* Column 1: Brand */}
+            <div className="space-y-6">
+              <div className="flex items-center gap-3">
+                <div className="bg-slate-900 dark:bg-white p-2.5 rounded-xl shadow-lg cursor-pointer" onClick={() => navigateTo('HOME')}>
+                  <FileText className="text-white dark:text-slate-900 w-5 h-5" />
+                </div>
+                <h1 className="text-2xl font-black tracking-tighter cursor-pointer" onClick={() => navigateTo('HOME')}>
+                  <span className="text-gradient">
+                    {t.title}
+                  </span>
+                </h1>
               </div>
-              <h1 className="text-2xl font-black tracking-tighter cursor-pointer" onClick={() => navigateTo('HOME')}>
-                <span className="text-gradient">
-                  {t.title}
-                </span>
-              </h1>
+              <p className="text-slate-500 dark:text-slate-400 font-medium leading-relaxed text-sm">
+                বিশ্বসেরা পিডিএফ টুলকিট। নিরাপদ এবং ১০০% ফ্রি প্রসেসিং। সরাসরি আপনার ব্রাউজারে কাজ করে।
+              </p>
             </div>
-            <p className="text-slate-400 dark:text-slate-500 font-medium leading-relaxed text-sm">
-              বিশ্বসেরা পিডিএফ টুলকিট। নিরাপদ এবং ১০০% ফ্রি প্রসেসিং।
-            </p>
-          </div>
-          
-          <div className="flex justify-center gap-8 font-black text-[10px] uppercase tracking-[0.2em] text-slate-400 dark:text-slate-600">
-            <button onClick={() => navigateTo('PRIVACY')} className="hover:text-indigo-600 transition-colors">{t.privacy}</button>
-            <button onClick={() => navigateTo('SAFETY')} className="hover:text-indigo-600 transition-colors">{t.safety}</button>
-            <button onClick={() => navigateTo('OPENSOURCE')} className="hover:text-indigo-600 transition-colors">{t.opensource}</button>
-          </div>
 
-          <div className="flex flex-col items-center md:items-end gap-1">
-            <div className="text-[9px] font-black uppercase tracking-[0.4em] text-slate-300 dark:text-slate-700">Developed With ❤️ In BD</div>
-            <p className="text-slate-400 dark:text-slate-500 text-[10px] font-bold">
-              © ২০২৫ {t.title} PRO.
-            </p>
+            {/* Column 2: Navigation */}
+            <div className="space-y-6">
+              <h4 className="text-[11px] font-black uppercase tracking-[0.2em] text-indigo-600 dark:text-indigo-400">{t.navTitle}</h4>
+              <ul className="space-y-4">
+                <li><button onClick={() => navigateTo('PRIVACY')} className="text-sm font-bold text-slate-500 dark:text-slate-400 hover:text-indigo-600 transition-colors">{t.privacy}</button></li>
+                <li><button onClick={() => navigateTo('SAFETY')} className="text-sm font-bold text-slate-500 dark:text-slate-400 hover:text-indigo-600 transition-colors">{t.safety}</button></li>
+                <li><button onClick={() => navigateTo('OPENSOURCE')} className="text-sm font-bold text-slate-500 dark:text-slate-400 hover:text-indigo-600 transition-colors">{t.opensource}</button></li>
+              </ul>
+            </div>
+
+            {/* Column 3: Connect & Support */}
+            <div className="space-y-6">
+              <h4 className="text-[11px] font-black uppercase tracking-[0.2em] text-pink-600 dark:text-pink-400">{t.connectTitle}</h4>
+              <div className="flex items-center gap-4">
+                <a href="mailto:gourobsaha2319@gmail.com" className="p-3 bg-slate-50 dark:bg-slate-800 rounded-2xl text-slate-500 hover:text-indigo-600 hover:bg-white dark:hover:bg-slate-700 shadow-sm transition-all border border-slate-100 dark:border-slate-700">
+                  <Mail className="w-5 h-5" />
+                </a>
+                <a href="https://www.linkedin.com/in/gourob-saha-9895442a9/" target="_blank" rel="noopener noreferrer" className="p-3 bg-slate-50 dark:bg-slate-800 rounded-2xl text-slate-500 hover:text-indigo-600 hover:bg-white dark:hover:bg-slate-700 shadow-sm transition-all border border-slate-100 dark:border-slate-700">
+                  <Linkedin className="w-5 h-5" />
+                </a>
+                <a href="https://facebook.com/profile.php?id=100093706797985" target="_blank" rel="noopener noreferrer" className="p-3 bg-slate-50 dark:bg-slate-800 rounded-2xl text-slate-500 hover:text-indigo-600 hover:bg-white dark:hover:bg-slate-700 shadow-sm transition-all border border-slate-100 dark:border-slate-700">
+                  <Facebook className="w-5 h-5" />
+                </a>
+              </div>
+              <a 
+                href="https://m.me/gourob23" 
+                target="_blank" 
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-3 px-6 py-3 bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-2xl font-black text-xs shadow-xl shadow-indigo-200 dark:shadow-none hover:-translate-y-1 transition-all"
+              >
+                <MessageCircle className="w-4 h-4" /> {t.sendSuggestion}
+              </a>
+            </div>
+
+            {/* Column 4: Attribution */}
+            <div className="space-y-6 lg:text-right">
+              <div className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-400 dark:text-slate-600">{t.devWith}</div>
+              <p className="text-slate-400 dark:text-slate-500 text-[10px] font-bold">
+                © ২০২৫ {t.title} PRO. <br/> 
+                <span className="opacity-50 mt-1 inline-block">All Rights Reserved</span>
+              </p>
+            </div>
           </div>
         </div>
       </footer>
