@@ -7,7 +7,7 @@ import {
   ChevronRight, FilePlus, PlusCircle, Sun, Moon, Languages, Search,
   Copy, ExternalLink, Sparkles, LayoutDashboard, ShieldCheck, ZapIcon,
   Lock, Heart, Code, Monitor, FileType, Share2, BrainCircuit,
-  Linkedin, Facebook, Mail, MessageCircle, Eye
+  Linkedin, Facebook, Mail, MessageCircle, Eye, Terminal
 } from 'lucide-react';
 import JSZip from 'jszip';
 import { PDFDocument } from 'pdf-lib';
@@ -36,6 +36,7 @@ const translations = {
     completed: 'কাজ সম্পন্ন হয়েছে!',
     reset: 'নতুন কাজ শুরু করুন',
     error: 'একটি ত্রুটি দেখা দিয়েছে।',
+    errorDetail: 'বিস্তারিত সমস্যা:',
     pdfToImg: 'পিডিএফ থেকে ছবি',
     imgToPdf: 'ছবি থেকে পিডিএফ',
     merge: 'পিডিএফ মার্জ',
@@ -112,6 +113,7 @@ const translations = {
     completed: 'Task Completed!',
     reset: 'Start New Task',
     error: 'An error occurred.',
+    errorDetail: 'Error Details:',
     pdfToImg: 'PDF to Image',
     imgToPdf: 'Image to PDF',
     merge: 'Merge PDF',
@@ -230,7 +232,7 @@ const App: React.FC = () => {
       canvas.width = viewport.width;
       await page.render({ canvasContext: context, viewport }).promise;
       return canvas.toDataURL();
-    } catch (err) {
+    } catch (err: any) {
       console.error("Preview failed:", err);
       return null;
     }
@@ -260,16 +262,18 @@ const App: React.FC = () => {
     // Update metadata and generate previews
     if (activeTool !== 'IMAGE_TO_PDF') {
       for (const file of selectedFiles) {
-        const previewUrl = await generatePreview(file);
-        if (previewUrl) setPreviews(prev => [...prev, previewUrl]);
-        
-        if (activeTool === 'SPLIT_PDF' || activeTool === 'PDF_TO_IMAGE' || activeTool === 'OCR_PDF') {
-          try {
+        try {
+          const previewUrl = await generatePreview(file);
+          if (previewUrl) setPreviews(prev => [...prev, previewUrl]);
+          
+          if (activeTool === 'SPLIT_PDF' || activeTool === 'PDF_TO_IMAGE' || activeTool === 'OCR_PDF') {
             const arrayBuffer = await file.arrayBuffer();
             const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
             setMaxPages(pdf.numPages);
             setSplitRange({ start: 1, end: pdf.numPages });
-          } catch (err) { console.error(err); }
+          }
+        } catch (err: any) {
+          setError(err?.message || "Error reading PDF file metadata.");
         }
       }
     }
@@ -283,7 +287,7 @@ const App: React.FC = () => {
       const arrayBuffer = await files[0].arrayBuffer();
       const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
       let textContent = '';
-      const pagesToScan = Math.min(pdf.numPages, 3); // Get text from first 3 pages
+      const pagesToScan = Math.min(pdf.numPages, 3);
       for (let i = 1; i <= pagesToScan; i++) {
         const page = await pdf.getPage(i);
         const text = await page.getTextContent();
@@ -291,8 +295,8 @@ const App: React.FC = () => {
       }
       const summary = await getPDFSummary(textContent);
       setAiSummary(summary);
-    } catch (err) {
-      setError(lang === 'bn' ? 'এআই সারসংক্ষেপ তৈরিতে সমস্যা হয়েছে।' : 'Failed to generate AI summary.');
+    } catch (err: any) {
+      setError(`${lang === 'bn' ? 'এআই সারসংক্ষেপ তৈরিতে সমস্যা হয়েছে।' : 'Failed to generate AI summary.'} (${err?.message || 'Unknown'})`);
     } finally {
       setIsSummarizing(false);
     }
@@ -322,6 +326,7 @@ const App: React.FC = () => {
     if (files.length === 0) return;
     setStatus(ConversionStatus.PROCESSING);
     setProgress(0);
+    setError(null);
     let fullExtractedText = '';
 
     try {
@@ -353,8 +358,9 @@ const App: React.FC = () => {
       setStatus(ConversionStatus.COMPLETED);
       setProgress(100);
       setStatusDetail('');
-    } catch (err) {
-      setError(t.error);
+    } catch (err: any) {
+      console.error(err);
+      setError(err?.message || "Unknown error during OCR processing.");
       setStatus(ConversionStatus.ERROR);
     }
   };
@@ -363,6 +369,7 @@ const App: React.FC = () => {
     if (files.length === 0) return;
     setStatus(ConversionStatus.PROCESSING);
     setProgress(0);
+    setError(null);
     const zip = new JSZip();
 
     try {
@@ -391,13 +398,18 @@ const App: React.FC = () => {
       triggerDownload(content, `converted_images.zip`);
       setStatus(ConversionStatus.COMPLETED);
       setStatusDetail('');
-    } catch (err) { setError(t.error); setStatus(ConversionStatus.ERROR); }
+    } catch (err: any) { 
+      console.error(err);
+      setError(err?.message || "Unknown error during PDF to Image conversion.");
+      setStatus(ConversionStatus.ERROR); 
+    }
   };
 
   const processImageToPDF = async () => {
     if (files.length === 0) return;
     setStatus(ConversionStatus.PROCESSING);
     setProgress(0);
+    setError(null);
     setStatusDetail(t.creatingPdf);
 
     try {
@@ -414,9 +426,10 @@ const App: React.FC = () => {
           reader.onload = () => {
             const el = new Image();
             el.onload = () => resolve(el);
-            el.onerror = reject;
+            el.onerror = () => reject(new Error(`Failed to load image: ${file.name}`));
             el.src = reader.result as string;
           };
+          reader.onerror = () => reject(new Error(`Failed to read file: ${file.name}`));
           reader.readAsDataURL(file);
         });
 
@@ -445,40 +458,56 @@ const App: React.FC = () => {
       triggerDownload(new Blob([pdfBytes]), 'converted_document.pdf');
       setStatus(ConversionStatus.COMPLETED);
       setStatusDetail('');
-    } catch (err) { setError(t.error); setStatus(ConversionStatus.ERROR); }
+    } catch (err: any) { 
+      console.error(err);
+      setError(err?.message || "Unknown error during Image to PDF conversion.");
+      setStatus(ConversionStatus.ERROR); 
+    }
   };
 
   const processMergePDF = async () => {
     if (files.length < 2) return;
     setStatus(ConversionStatus.PROCESSING);
+    setProgress(0);
+    setError(null);
     setStatusDetail(t.merging);
-    setProgress(50);
     try {
       const mergedPdf = await PDFDocument.create();
-      for (const file of files) {
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
         const bytes = await file.arrayBuffer();
         const pdf = await PDFDocument.load(bytes);
         const copiedPages = await mergedPdf.copyPages(pdf, pdf.getPageIndices());
         copiedPages.forEach((page) => mergedPdf.addPage(page));
+        setProgress(Math.round(((i + 1) / files.length) * 100));
       }
       const mergedBytes = await mergedPdf.save();
       triggerDownload(new Blob([mergedBytes]), 'merged_document.pdf');
       setStatus(ConversionStatus.COMPLETED);
-      setProgress(100);
       setStatusDetail('');
-    } catch (err) { setError(t.error); setStatus(ConversionStatus.ERROR); }
+    } catch (err: any) { 
+      console.error(err);
+      setError(err?.message || "Unknown error during PDF merging. Ensure files are not corrupted or encrypted.");
+      setStatus(ConversionStatus.ERROR); 
+    }
   };
 
   const processSplitPDF = async () => {
     if (files.length === 0) return;
     setStatus(ConversionStatus.PROCESSING);
+    setProgress(0);
+    setError(null);
     setStatusDetail(t.splitting);
-    setProgress(50);
     try {
       const bytes = await files[0].arrayBuffer();
       const splitPdf = await PDFDocument.create();
       const start = Math.max(1, splitRange.start);
       const end = Math.min(maxPages, splitRange.end);
+      
+      if (start > end) {
+        throw new Error("Start page cannot be greater than end page.");
+      }
+
       const indices = Array.from({ length: end - start + 1 }, (_, i) => i + start - 1);
       const sourcePdfDoc = await PDFDocument.load(bytes);
       const copiedPages = await splitPdf.copyPages(sourcePdfDoc, indices);
@@ -488,7 +517,11 @@ const App: React.FC = () => {
       setStatus(ConversionStatus.COMPLETED);
       setProgress(100);
       setStatusDetail('');
-    } catch (err) { setError(t.error); setStatus(ConversionStatus.ERROR); }
+    } catch (err: any) { 
+      console.error(err);
+      setError(err?.message || "Unknown error during PDF splitting.");
+      setStatus(ConversionStatus.ERROR); 
+    }
   };
 
   const resetTool = () => {
@@ -939,10 +972,34 @@ const App: React.FC = () => {
                       </button>
                     )}
                     {error && (
-                      <div className="p-8 bg-rose-50 dark:bg-rose-900/20 border-2 border-rose-100 dark:border-rose-800/20 rounded-[2.5rem] flex items-start gap-4 text-rose-600 dark:text-rose-400 text-sm font-bold shadow-xl animate-in shake duration-500">
-                        <AlertCircle className="w-7 h-7 shrink-0" />
-                        <span className="leading-relaxed">{error}</span>
-                        <button onClick={() => setError(null)} className="ml-auto p-2 opacity-50 hover:opacity-100 transition-opacity">×</button>
+                      <div className="p-8 bg-rose-50 dark:bg-rose-900/20 border-2 border-rose-100 dark:border-rose-800/20 rounded-[2.5rem] flex flex-col gap-6 text-rose-600 dark:text-rose-400 text-sm font-bold shadow-2xl animate-in shake duration-500">
+                        <div className="flex items-start gap-4">
+                          <AlertCircle className="w-8 h-8 shrink-0 text-rose-500" />
+                          <div className="space-y-1">
+                            <span className="text-lg font-black tracking-tight block">{t.error}</span>
+                            <span className="font-medium opacity-80 leading-relaxed">{t.errorDetail}</span>
+                          </div>
+                          <button onClick={() => setError(null)} className="ml-auto p-2 bg-rose-100 dark:bg-rose-800/40 rounded-xl hover:bg-rose-200 transition-colors">×</button>
+                        </div>
+                        <div className="p-5 bg-white/50 dark:bg-black/20 rounded-2xl border border-rose-200 dark:border-rose-800/30 overflow-hidden">
+                           <div className="flex items-center gap-2 mb-3 text-[10px] font-black uppercase tracking-widest opacity-60">
+                             <Terminal className="w-3 h-3" /> System Trace
+                           </div>
+                           <code className="block font-mono text-[11px] break-all whitespace-pre-wrap leading-relaxed opacity-90">
+                             {error}
+                           </code>
+                        </div>
+                        <div className="flex justify-end gap-3">
+                          <button 
+                            onClick={() => {
+                              navigator.clipboard.writeText(error || "");
+                              alert(t.copied);
+                            }}
+                            className="px-4 py-2 bg-rose-100 dark:bg-rose-800/40 rounded-xl text-xs font-black uppercase tracking-widest hover:bg-rose-200 transition-all flex items-center gap-2"
+                          >
+                             <Copy className="w-3 h-3" /> Copy Log
+                          </button>
+                        </div>
                       </div>
                     )}
                   </div>
