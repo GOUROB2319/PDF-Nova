@@ -7,12 +7,13 @@ import {
   ChevronRight, FilePlus, PlusCircle, Sun, Moon, Languages, Search,
   Copy, ExternalLink, Sparkles, LayoutDashboard, ShieldCheck, ZapIcon,
   Lock, Heart, Code, Monitor, FileType, Share2, BrainCircuit,
-  Linkedin, Facebook, Mail, MessageCircle
+  Linkedin, Facebook, Mail, MessageCircle, Eye
 } from 'lucide-react';
 import JSZip from 'jszip';
-import { PDFDocument, PageSizes } from 'pdf-lib';
+import { PDFDocument } from 'pdf-lib';
 import Tesseract from 'tesseract.js';
-import { ConversionStatus, ToolType, FileMetadata, ConversionConfig, PDFOutputConfig } from './types';
+import { ConversionStatus, ToolType, ConversionConfig, PDFOutputConfig } from './types';
+import { getPDFSummary } from './services/geminiService';
 
 declare const pdfjsLib: any;
 
@@ -91,7 +92,9 @@ const translations = {
     navTitle: 'নেভিগেশন',
     connectTitle: 'কানেক্ট ও সাপোর্ট',
     sendSuggestion: 'পরামর্শ পাঠান',
-    devWith: 'DEVELOPED WITH ❤️ IN BD'
+    devWith: 'DEVELOPED WITH ❤️ IN BD',
+    preview: 'প্রিভিউ',
+    generateAISummary: 'এআই দিয়ে সারসংক্ষেপ দেখুন'
   },
   en: {
     title: 'PDF Nova',
@@ -165,7 +168,9 @@ const translations = {
     navTitle: 'NAVIGATION',
     connectTitle: 'CONNECT & SUPPORT',
     sendSuggestion: 'Send Suggestion',
-    devWith: 'DEVELOPED WITH ❤️ IN BD'
+    devWith: 'DEVELOPED WITH ❤️ IN BD',
+    preview: 'Preview',
+    generateAISummary: 'View AI Summary'
   }
 };
 
@@ -177,11 +182,14 @@ const App: React.FC = () => {
   const [view, setView] = useState<ViewType>('HOME');
   const [activeTool, setActiveTool] = useState<ToolType | null>(null);
   const [files, setFiles] = useState<File[]>([]);
+  const [previews, setPreviews] = useState<string[]>([]);
   const [status, setStatus] = useState<ConversionStatus>(ConversionStatus.IDLE);
   const [progress, setProgress] = useState(0);
   const [statusDetail, setStatusDetail] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [ocrText, setOcrText] = useState<string | null>(null);
+  const [aiSummary, setAiSummary] = useState<string | null>(null);
+  const [isSummarizing, setIsSummarizing] = useState(false);
   const [copied, setCopied] = useState(false);
 
   const [imageConfig, setImageConfig] = useState<ConversionConfig>({
@@ -209,34 +217,23 @@ const App: React.FC = () => {
     }
   }, [darkMode]);
 
-  // Helper to enhance image for OCR
-  const enhanceImageForOCR = (canvas: HTMLCanvasElement) => {
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const data = imageData.data;
-    
-    for (let i = 0; i < data.length; i += 4) {
-      const r = data[i];
-      const g = data[i + 1];
-      const b = data[i + 2];
-      
-      const gray = 0.299 * r + 0.587 * g + 0.114 * b;
-      
-      let value = gray;
-      if (gray > 180) {
-        value = 255; 
-      } else if (gray < 100) {
-        value = 0; 
-      }
-      
-      data[i] = value;
-      data[i + 1] = value;
-      data[i + 2] = value;
+  const generatePreview = async (file: File) => {
+    if (file.type !== 'application/pdf') return;
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      const page = await pdf.getPage(1);
+      const viewport = page.getViewport({ scale: 0.4 });
+      const canvas = document.createElement('canvas');
+      const context = canvas.getContext('2d');
+      canvas.height = viewport.height;
+      canvas.width = viewport.width;
+      await page.render({ canvasContext: context, viewport }).promise;
+      return canvas.toDataURL();
+    } catch (err) {
+      console.error("Preview failed:", err);
+      return null;
     }
-    
-    ctx.putImageData(imageData, 0, 0);
   };
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -260,22 +257,53 @@ const App: React.FC = () => {
     setFiles(prev => [...prev, ...selectedFiles]);
     setError(null);
 
-    if (activeTool === 'SPLIT_PDF' && selectedFiles.length > 0) {
-      try {
-        const arrayBuffer = await selectedFiles[0].arrayBuffer();
-        const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-        setMaxPages(pdf.numPages);
-        setSplitRange({ start: 1, end: pdf.numPages });
-      } catch (err) {
-        console.error("Error reading PDF metadata:", err);
+    // Update metadata and generate previews
+    if (activeTool !== 'IMAGE_TO_PDF') {
+      for (const file of selectedFiles) {
+        const previewUrl = await generatePreview(file);
+        if (previewUrl) setPreviews(prev => [...prev, previewUrl]);
+        
+        if (activeTool === 'SPLIT_PDF' || activeTool === 'PDF_TO_IMAGE' || activeTool === 'OCR_PDF') {
+          try {
+            const arrayBuffer = await file.arrayBuffer();
+            const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+            setMaxPages(pdf.numPages);
+            setSplitRange({ start: 1, end: pdf.numPages });
+          } catch (err) { console.error(err); }
+        }
       }
+    }
+  };
+
+  const handleAISummary = async () => {
+    if (files.length === 0) return;
+    setIsSummarizing(true);
+    setAiSummary(null);
+    try {
+      const arrayBuffer = await files[0].arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      let textContent = '';
+      const pagesToScan = Math.min(pdf.numPages, 3); // Get text from first 3 pages
+      for (let i = 1; i <= pagesToScan; i++) {
+        const page = await pdf.getPage(i);
+        const text = await page.getTextContent();
+        textContent += text.items.map((item: any) => item.str).join(' ');
+      }
+      const summary = await getPDFSummary(textContent);
+      setAiSummary(summary);
+    } catch (err) {
+      setError(lang === 'bn' ? 'এআই সারসংক্ষেপ তৈরিতে সমস্যা হয়েছে।' : 'Failed to generate AI summary.');
+    } finally {
+      setIsSummarizing(false);
     }
   };
 
   const removeFile = (index: number) => {
     setFiles(prev => prev.filter((_, i) => i !== index));
+    setPreviews(prev => prev.filter((_, i) => i !== index));
     if (files.length <= 1) {
       setOcrText(null);
+      setAiSummary(null);
       setMaxPages(1);
       setSplitRange({ start: 1, end: 1 });
     }
@@ -304,13 +332,12 @@ const App: React.FC = () => {
       for (let i = 1; i <= numPages; i++) {
         setStatusDetail(t.pageOf.replace('{current}', i.toString()).replace('{total}', numPages.toString()));
         const page = await pdf.getPage(i);
-        const viewport = page.getViewport({ scale: 2.8 });
+        const viewport = page.getViewport({ scale: 2.5 });
         const canvas = document.createElement('canvas');
         const context = canvas.getContext('2d');
         canvas.height = viewport.height;
         canvas.width = viewport.width;
         await page.render({ canvasContext: context, viewport }).promise;
-        enhanceImageForOCR(canvas);
         const imgData = canvas.toDataURL('image/png');
         const result = await Tesseract.recognize(imgData, 'ben+eng', {
           logger: m => {
@@ -327,29 +354,9 @@ const App: React.FC = () => {
       setProgress(100);
       setStatusDetail('');
     } catch (err) {
-      console.error(err);
       setError(t.error);
       setStatus(ConversionStatus.ERROR);
     }
-  };
-
-  const getWordBlob = () => {
-    if (!ocrText) return null;
-    const header = "<html xmlns:o='urn:schemas-microsoft-com:office:office' "+
-          "xmlns:w='urn:schemas-microsoft-com:office:word' "+
-          "xmlns='http://www.w3.org/TR/REC-html40'>"+
-          "<head><meta charset='utf-8'><title>Export Word</title><style>body { font-family: 'Inter', 'Hind Siliguri', sans-serif; }</style></head><body>";
-    const footer = "</body></html>";
-    const sourceHTML = header + ocrText.replace(/\n/g, '<br>') + footer;
-    
-    return new Blob(['\ufeff', sourceHTML], {
-      type: 'application/msword'
-    });
-  };
-
-  const downloadAsWord = () => {
-    const blob = getWordBlob();
-    if (blob) triggerDownload(blob, 'extracted_text.doc');
   };
 
   const processPDFToImage = async () => {
@@ -422,8 +429,7 @@ const App: React.FC = () => {
         const compressedDataUrl = canvas.toDataURL('image/jpeg', quality);
         const imageBytes = await fetch(compressedDataUrl).then(res => res.arrayBuffer());
         
-        let pdfImage = await pdfDoc.embedJpg(imageBytes);
-
+        const pdfImage = await pdfDoc.embedJpg(imageBytes);
         const page = pdfDoc.addPage([pdfImage.width, pdfImage.height]);
         page.drawImage(pdfImage, {
           x: 0,
@@ -439,11 +445,7 @@ const App: React.FC = () => {
       triggerDownload(new Blob([pdfBytes]), 'converted_document.pdf');
       setStatus(ConversionStatus.COMPLETED);
       setStatusDetail('');
-    } catch (err) {
-      console.error(err);
-      setError(t.error);
-      setStatus(ConversionStatus.ERROR);
-    }
+    } catch (err) { setError(t.error); setStatus(ConversionStatus.ERROR); }
   };
 
   const processMergePDF = async () => {
@@ -474,17 +476,13 @@ const App: React.FC = () => {
     setProgress(50);
     try {
       const bytes = await files[0].arrayBuffer();
-      const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
       const splitPdf = await PDFDocument.create();
-      
       const start = Math.max(1, splitRange.start);
-      const end = Math.min(pdf.numPages, splitRange.end);
+      const end = Math.min(maxPages, splitRange.end);
       const indices = Array.from({ length: end - start + 1 }, (_, i) => i + start - 1);
-      
       const sourcePdfDoc = await PDFDocument.load(bytes);
       const copiedPages = await splitPdf.copyPages(sourcePdfDoc, indices);
       copiedPages.forEach(page => splitPdf.addPage(page));
-      
       const splitBytes = await splitPdf.save();
       triggerDownload(new Blob([splitBytes]), `split_document.pdf`);
       setStatus(ConversionStatus.COMPLETED);
@@ -495,6 +493,8 @@ const App: React.FC = () => {
 
   const resetTool = () => {
     setFiles([]);
+    setPreviews([]);
+    setAiSummary(null);
     setStatus(ConversionStatus.IDLE);
     setProgress(0);
     setStatusDetail('');
@@ -684,17 +684,46 @@ const App: React.FC = () => {
                   ) : (
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                       {files.map((f, i) => (
-                        <div key={i} className="bg-white dark:bg-slate-900/50 border border-slate-100 dark:border-slate-700 rounded-[2rem] p-6 flex items-center gap-5 group/file animate-in fade-in zoom-in duration-300 hover:shadow-xl hover:-translate-y-1 transition-all">
-                          <div className="bg-slate-50 dark:bg-slate-800 p-4 rounded-2xl text-indigo-600 shadow-inner">
-                            {f.type.startsWith('image/') ? <ImageIcon className="w-8 h-8" /> : <FileText className="w-8 h-8" />}
+                        <div key={i} className="bg-white dark:bg-slate-900/50 border border-slate-100 dark:border-slate-700 rounded-[2rem] p-6 flex flex-col gap-4 group/file animate-in fade-in zoom-in duration-300 hover:shadow-xl hover:-translate-y-1 transition-all">
+                          <div className="flex items-center gap-5 w-full">
+                            <div className="bg-slate-50 dark:bg-slate-800 p-4 rounded-2xl text-indigo-600 shadow-inner overflow-hidden w-20 h-20 flex items-center justify-center">
+                              {previews[i] ? (
+                                <img src={previews[i]} alt="Preview" className="w-full h-full object-cover rounded-lg" />
+                              ) : (
+                                f.type.startsWith('image/') ? <ImageIcon className="w-8 h-8" /> : <FileText className="w-8 h-8" />
+                              )}
+                            </div>
+                            <div className="flex-1 truncate space-y-1">
+                              <div className="font-black text-slate-800 dark:text-slate-100 truncate text-lg tracking-tight">{f.name}</div>
+                              <div className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">{(f.size / (1024 * 1024)).toFixed(2)} MB • {t.preview}</div>
+                            </div>
+                            <button onClick={() => removeFile(i)} className="p-4 text-slate-300 hover:text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20 rounded-2xl transition-all">
+                              <Trash2 className="w-6 h-6" />
+                            </button>
                           </div>
-                          <div className="flex-1 truncate space-y-1">
-                            <div className="font-black text-slate-800 dark:text-slate-100 truncate text-lg tracking-tight">{f.name}</div>
-                            <div className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">{(f.size / (1024 * 1024)).toFixed(2)} MB • RAW DATA</div>
-                          </div>
-                          <button onClick={() => removeFile(i)} className="p-4 text-slate-300 hover:text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20 rounded-2xl transition-all">
-                            <Trash2 className="w-6 h-6" />
-                          </button>
+                          {activeTool === 'PDF_TO_IMAGE' && i === 0 && (
+                            <div className="pt-2">
+                                <button 
+                                  onClick={handleAISummary}
+                                  disabled={isSummarizing}
+                                  className="flex items-center gap-2 px-4 py-2 bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 rounded-xl font-bold text-xs hover:bg-indigo-100 transition-all border border-indigo-100 dark:border-indigo-900/30"
+                                >
+                                  {isSummarizing ? <Loader2 className="w-3 h-3 animate-spin" /> : <BrainCircuit className="w-3 h-3" />}
+                                  {t.generateAISummary}
+                                </button>
+                                {aiSummary && (
+                                  <div className="mt-4 p-5 bg-white dark:bg-slate-900/80 rounded-2xl border border-indigo-100 dark:border-indigo-900/30 shadow-sm animate-in fade-in slide-in-from-top-2">
+                                     <div className="flex items-center gap-2 mb-2 text-indigo-600 dark:text-indigo-400">
+                                       <Sparkles className="w-4 h-4" />
+                                       <span className="text-[10px] font-black uppercase tracking-widest">{t.aiSummary}</span>
+                                     </div>
+                                     <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed font-medium italic">
+                                       "{aiSummary}"
+                                     </p>
+                                  </div>
+                                )}
+                            </div>
+                          )}
                         </div>
                       ))}
                       {(activeTool === 'MERGE_PDF' || activeTool === 'IMAGE_TO_PDF') && (
@@ -727,7 +756,11 @@ const App: React.FC = () => {
                         </div>
                         <div className="flex items-center gap-3 flex-wrap">
                           <button 
-                            onClick={downloadAsWord}
+                            onClick={() => {
+                              const sourceHTML = "<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'><head><meta charset='utf-8'></head><body>" + ocrText.replace(/\n/g, '<br>') + "</body></html>";
+                              const blob = new Blob(['\ufeff', sourceHTML], { type: 'application/msword' });
+                              triggerDownload(blob, 'extracted_text.doc');
+                            }}
                             className="flex items-center gap-3 px-6 py-4 rounded-2xl font-black text-sm transition-all shadow-xl hover:-translate-y-1 bg-gradient-to-r from-blue-600 to-indigo-700 text-white"
                           >
                             <Download className="w-5 h-5" />
@@ -735,7 +768,7 @@ const App: React.FC = () => {
                           </button>
                           <button 
                             onClick={() => {
-                              navigator.clipboard.writeText(ocrText);
+                              navigator.clipboard.writeText(ocrText || "");
                               setCopied(true);
                               setTimeout(() => setCopied(false), 2000);
                             }}
@@ -747,11 +780,10 @@ const App: React.FC = () => {
                         </div>
                       </div>
                       <div className="relative">
-                        <div className="absolute -top-4 -left-4 w-20 h-20 bg-violet-500 opacity-10 blur-2xl"></div>
                         <textarea 
                           readOnly 
                           value={ocrText}
-                          className="w-full h-[600px] bg-slate-50/50 dark:bg-slate-900/50 border dark:border-slate-700/50 rounded-[2.5rem] p-10 text-slate-700 dark:text-slate-300 font-mono text-lg leading-relaxed shadow-inner focus:outline-none focus:ring-4 focus:ring-indigo-500/10 transition-all custom-scrollbar"
+                          className="w-full h-[600px] bg-slate-50/50 dark:bg-slate-900/50 border dark:border-slate-700/50 rounded-[2.5rem] p-10 text-slate-700 dark:text-slate-300 font-mono text-lg leading-relaxed shadow-inner focus:outline-none transition-all custom-scrollbar"
                         />
                       </div>
                     </div>
@@ -843,9 +875,7 @@ const App: React.FC = () => {
                             <div className="flex-1 space-y-3">
                               <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{t.from}</span>
                               <input 
-                                type="number" 
-                                min="1" 
-                                max={maxPages}
+                                type="number" min="1" max={maxPages}
                                 value={splitRange.start}
                                 onChange={(e) => setSplitRange(prev => ({...prev, start: parseInt(e.target.value) || 1}))}
                                 className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-indigo-500 rounded-2xl p-5 font-black text-xl text-indigo-600 dark:text-indigo-400 shadow-inner transition-all outline-none"
@@ -854,9 +884,7 @@ const App: React.FC = () => {
                             <div className="flex-1 space-y-3">
                               <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{t.to}</span>
                               <input 
-                                type="number" 
-                                min="1" 
-                                max={maxPages}
+                                type="number" min="1" max={maxPages}
                                 value={splitRange.end}
                                 onChange={(e) => setSplitRange(prev => ({...prev, end: parseInt(e.target.value) || 1}))}
                                 className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-indigo-500 rounded-2xl p-5 font-black text-xl text-indigo-600 dark:text-indigo-400 shadow-inner transition-all outline-none"
@@ -867,16 +895,6 @@ const App: React.FC = () => {
                             <span className="text-xs font-bold text-indigo-600 dark:text-indigo-400 uppercase tracking-widest">{t.totalPages}</span>
                             <span className="text-2xl font-black text-indigo-700 dark:text-indigo-300">{maxPages}</span>
                           </div>
-                        </div>
-                      )}
-                      {activeTool === 'OCR_PDF' && (
-                        <div className="p-8 bg-gradient-to-br from-indigo-50 to-purple-50 dark:from-indigo-900/10 dark:to-purple-900/10 rounded-[2rem] border-2 border-indigo-100 dark:border-indigo-800/20 space-y-4">
-                          <div className="bg-white dark:bg-slate-800 p-3 rounded-xl w-fit shadow-md text-indigo-600">
-                             <Sparkles className="w-6 h-6" />
-                          </div>
-                          <p className="text-sm font-bold text-slate-600 dark:text-slate-400 leading-relaxed">
-                            {lang === 'bn' ? 'আমাদের হাই-পাওয়ারড OCR ইঞ্জিন ব্যবহারের জন্য ধন্যবাদ। এটি আপনার পিসি থেকেই কাজ করে।' : 'Using high-powered client-side OCR engine. Zero data leaves your machine.'}
-                          </p>
                         </div>
                       )}
                     </div>
@@ -904,12 +922,7 @@ const App: React.FC = () => {
                             <div className="text-3xl font-black text-emerald-900 dark:text-emerald-300 tracking-tighter">{t.completed}</div>
                             <p className="text-emerald-600 dark:text-emerald-500/70 font-bold leading-relaxed">{lang === 'bn' ? 'ফাইল প্রসেস শেষ হয়েছে। চেক করুন!' : 'Your files have been processed successfully.'}</p>
                          </div>
-                         <button 
-                          onClick={resetTool} 
-                          className="w-full bg-emerald-600 text-white py-6 rounded-[2rem] font-black text-lg shadow-xl shadow-emerald-200 dark:shadow-none hover:bg-emerald-700 transition-all active:scale-95"
-                         >
-                          {t.reset}
-                        </button>
+                         <button onClick={resetTool} className="w-full bg-emerald-600 text-white py-6 rounded-[2rem] font-black text-lg shadow-xl shadow-emerald-200 dark:shadow-none hover:bg-emerald-700 transition-all active:scale-95">{t.reset}</button>
                       </div>
                     ) : (
                       <button 
@@ -920,7 +933,7 @@ const App: React.FC = () => {
                           else if (activeTool === 'MERGE_PDF') processMergePDF();
                           else if (activeTool === 'SPLIT_PDF') processSplitPDF();
                         }}
-                        className={`w-full bg-gradient-to-r ${toolList.find(t => t.id === activeTool)?.gradient} text-white py-8 rounded-[3rem] font-black text-2xl shadow-2xl shadow-indigo-300/40 dark:shadow-none hover:shadow-indigo-500/50 transition-all hover:-translate-y-2 active:scale-95 flex items-center justify-center gap-5 group/btn`}
+                        className={`w-full bg-gradient-to-r ${toolList.find(t => t.id === activeTool)?.gradient} text-white py-8 rounded-[3rem] font-black text-2xl shadow-2xl transition-all hover:-translate-y-2 active:scale-95 flex items-center justify-center gap-5 group/btn`}
                       >
                         <Zap className="w-8 h-8 group-hover/btn:animate-bounce" /> {t.process}
                       </button>
@@ -969,15 +982,6 @@ const App: React.FC = () => {
                    {view === 'OPENSOURCE' && t.opensourceContent}
                  </p>
                </div>
-
-               <div className="pt-10 border-t dark:border-slate-700 flex flex-wrap gap-6">
-                 <div className="flex items-center gap-3 text-emerald-500 font-black uppercase tracking-widest text-xs">
-                    <CheckCircle2 className="w-5 h-5" /> Trusted by Thousands
-                 </div>
-                 <div className="flex items-center gap-3 text-indigo-500 font-black uppercase tracking-widest text-xs">
-                    <ShieldCheck className="w-5 h-5" /> ISO Standard Security
-                 </div>
-               </div>
             </div>
           </div>
         )}
@@ -986,7 +990,6 @@ const App: React.FC = () => {
       <footer className="mt-12 border-t dark:border-slate-800 py-10 relative overflow-hidden bg-white/50 dark:bg-slate-900/50 glass">
         <div className="max-w-7xl mx-auto px-6">
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-12">
-            {/* Column 1: Brand */}
             <div className="space-y-6">
               <div className="flex items-center gap-3">
                 <div className="bg-slate-900 dark:bg-white p-2.5 rounded-xl shadow-lg cursor-pointer" onClick={() => navigateTo('HOME')}>
@@ -1003,7 +1006,6 @@ const App: React.FC = () => {
               </p>
             </div>
 
-            {/* Column 2: Navigation */}
             <div className="space-y-6">
               <h4 className="text-[11px] font-black uppercase tracking-[0.2em] text-indigo-600 dark:text-indigo-400">{t.navTitle}</h4>
               <ul className="space-y-4">
@@ -1013,7 +1015,6 @@ const App: React.FC = () => {
               </ul>
             </div>
 
-            {/* Column 3: Connect & Support */}
             <div className="space-y-6">
               <h4 className="text-[11px] font-black uppercase tracking-[0.2em] text-pink-600 dark:text-pink-400">{t.connectTitle}</h4>
               <div className="flex items-center gap-4">
@@ -1037,7 +1038,6 @@ const App: React.FC = () => {
               </a>
             </div>
 
-            {/* Column 4: Attribution */}
             <div className="space-y-6 lg:text-right">
               <div className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-400 dark:text-slate-600">{t.devWith}</div>
               <p className="text-slate-400 dark:text-slate-500 text-[10px] font-bold">
