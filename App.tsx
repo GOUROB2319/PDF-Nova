@@ -6,14 +6,12 @@ import {
   SlidersHorizontal, Scissors, Combine, Zap, ArrowLeft,
   ChevronRight, FilePlus, PlusCircle, Sun, Moon, Languages, Search,
   Copy, ExternalLink, Sparkles, LayoutDashboard, ShieldCheck, ZapIcon,
-  Lock, Heart, Code, Monitor, FileType, Share2, BrainCircuit,
-  Facebook, Linkedin, Mail, MessageSquareMore
+  Lock, Heart, Code, Monitor, FileType, Share2, BrainCircuit
 } from 'lucide-react';
 import JSZip from 'jszip';
 import { PDFDocument, PageSizes } from 'pdf-lib';
 import Tesseract from 'tesseract.js';
 import { ConversionStatus, ToolType, FileMetadata, ConversionConfig, PDFOutputConfig } from './types';
-import { getPDFSummary } from './services/geminiService';
 
 declare const pdfjsLib: any;
 
@@ -88,8 +86,7 @@ const translations = {
     high: 'হাই',
     creatingPdf: 'পিডিএফ তৈরি হচ্ছে...',
     shareDenied: 'সিকিউরিটি পলিসির কারণে সরাসরি অ্যাপ ওপেন করা সম্ভব হয়নি। ফাইলটি ডাউনলোড করুন।',
-    ocrTip: 'টিপস: ঝকঝকে স্ক্যান করা পিডিএফ ব্যবহার করলে নির্ভুল টেক্সট পাওয়া যায়।',
-    suggestions: 'পরামর্শ পাঠান'
+    ocrTip: 'টিপস: ঝকঝকে স্ক্যান করা পিডিএফ ব্যবহার করলে নির্ভুল টেক্সট পাওয়া যায়।'
   },
   en: {
     title: 'PDF Nova',
@@ -159,8 +156,7 @@ const translations = {
     high: 'High',
     creatingPdf: 'Creating PDF...',
     shareDenied: 'Could not open app due to security policy. Please use Download instead.',
-    ocrTip: 'Tip: Use high-quality scanned PDFs for best accuracy.',
-    suggestions: 'Send Feedback'
+    ocrTip: 'Tip: Use high-quality scanned PDFs for best accuracy.'
   }
 };
 
@@ -177,8 +173,6 @@ const App: React.FC = () => {
   const [statusDetail, setStatusDetail] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [ocrText, setOcrText] = useState<string | null>(null);
-  const [aiSummary, setAiSummary] = useState<string | null>(null);
-  const [isSummarizing, setIsSummarizing] = useState(false);
   const [copied, setCopied] = useState(false);
 
   const [imageConfig, setImageConfig] = useState<ConversionConfig>({
@@ -273,7 +267,6 @@ const App: React.FC = () => {
     setFiles(prev => prev.filter((_, i) => i !== index));
     if (files.length <= 1) {
       setOcrText(null);
-      setAiSummary(null);
       setMaxPages(1);
       setSplitRange({ start: 1, end: 1 });
     }
@@ -302,17 +295,14 @@ const App: React.FC = () => {
       for (let i = 1; i <= numPages; i++) {
         setStatusDetail(t.pageOf.replace('{current}', i.toString()).replace('{total}', numPages.toString()));
         const page = await pdf.getPage(i);
-        
         const viewport = page.getViewport({ scale: 2.8 });
         const canvas = document.createElement('canvas');
         const context = canvas.getContext('2d');
         canvas.height = viewport.height;
         canvas.width = viewport.width;
-
         await page.render({ canvasContext: context, viewport }).promise;
         enhanceImageForOCR(canvas);
         const imgData = canvas.toDataURL('image/png');
-        
         const result = await Tesseract.recognize(imgData, 'ben+eng', {
           logger: m => {
             if (m.status === 'recognizing text') {
@@ -321,10 +311,8 @@ const App: React.FC = () => {
             }
           }
         });
-
         fullExtractedText += `--- Page ${i} ---\n${result.data.text.trim()}\n\n`;
       }
-
       setOcrText(fullExtractedText || t.noText);
       setStatus(ConversionStatus.COMPLETED);
       setProgress(100);
@@ -336,19 +324,6 @@ const App: React.FC = () => {
     }
   };
 
-  const generateSummary = async () => {
-    if (!ocrText) return;
-    setIsSummarizing(true);
-    try {
-      const summary = await getPDFSummary(ocrText);
-      setAiSummary(summary);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setIsSummarizing(false);
-    }
-  };
-
   const getWordBlob = () => {
     if (!ocrText) return null;
     const header = "<html xmlns:o='urn:schemas-microsoft-com:office:office' "+
@@ -356,7 +331,7 @@ const App: React.FC = () => {
           "xmlns='http://www.w3.org/TR/REC-html40'>"+
           "<head><meta charset='utf-8'><title>Export Word</title><style>body { font-family: 'Inter', 'Hind Siliguri', sans-serif; }</style></head><body>";
     const footer = "</body></html>";
-    const sourceHTML = header + (aiSummary ? `<h2>Summary</h2><p>${aiSummary.replace(/\n/g, '<br>')}</p><hr>` : '') + ocrText.replace(/\n/g, '<br>') + footer;
+    const sourceHTML = header + ocrText.replace(/\n/g, '<br>') + footer;
     
     return new Blob(['\ufeff', sourceHTML], {
       type: 'application/msword'
@@ -366,33 +341,6 @@ const App: React.FC = () => {
   const downloadAsWord = () => {
     const blob = getWordBlob();
     if (blob) triggerDownload(blob, 'extracted_text.doc');
-  };
-
-  const shareOrOpenWithWord = async () => {
-    const blob = getWordBlob();
-    if (!blob) return;
-
-    const file = new File([blob], 'extracted_text.doc', { type: 'application/msword' });
-
-    if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
-      try {
-        await navigator.share({
-          files: [file],
-          title: 'Extracted PDF Text',
-          text: 'PDF OCR Result'
-        });
-      } catch (err: any) {
-        console.error("Sharing failed:", err);
-        if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
-          setError(t.shareDenied);
-          downloadAsWord();
-        } else if (err.name !== 'AbortError') {
-          downloadAsWord();
-        }
-      }
-    } else {
-      downloadAsWord();
-    }
   };
 
   const processPDFToImage = async () => {
@@ -543,7 +491,6 @@ const App: React.FC = () => {
     setStatusDetail('');
     setError(null);
     setOcrText(null);
-    setAiSummary(null);
     setMaxPages(1);
     setSplitRange({ start: 1, end: 1 });
   };
@@ -761,49 +708,15 @@ const App: React.FC = () => {
                       <p className="text-sm font-bold text-amber-800 dark:text-amber-200">{t.ocrTip}</p>
                     </div>
 
-                    {aiSummary && (
-                      <div className="bg-gradient-to-br from-indigo-600 to-violet-700 rounded-[3rem] p-10 shadow-2xl text-white relative overflow-hidden group">
-                        <div className="absolute top-0 right-0 w-64 h-64 bg-white/10 rounded-full blur-3xl -mr-32 -mt-32"></div>
-                        <div className="relative z-10 space-y-6">
-                           <div className="flex items-center gap-4">
-                              <div className="bg-white/20 p-4 rounded-2xl backdrop-blur-md">
-                                 <BrainCircuit className="w-8 h-8 text-white" />
-                              </div>
-                              <h4 className="text-3xl font-black tracking-tighter">{t.aiSummary}</h4>
-                           </div>
-                           <p className="text-lg font-medium leading-relaxed text-indigo-50">
-                             {aiSummary}
-                           </p>
-                        </div>
-                      </div>
-                    )}
-
                     <div className="bg-white/80 dark:bg-slate-800/80 glass rounded-[3rem] p-12 shadow-2xl">
                       <div className="flex items-center justify-between mb-10 flex-wrap gap-4">
                         <div className="flex items-center gap-4">
                           <div className="p-4 rounded-2xl bg-violet-100 dark:bg-violet-900/30 text-violet-600">
                              <FileType className="w-7 h-7" />
                           </div>
-                          <h4 className="text-3xl font-black dark:text-white tracking-tighter">{t.ocrResult}</h4>
+                          <h4 className="text-3xl font-black text-slate-900 dark:text-white tracking-tighter">{t.ocrResult}</h4>
                         </div>
                         <div className="flex items-center gap-3 flex-wrap">
-                          {!aiSummary && (
-                            <button 
-                              onClick={generateSummary}
-                              disabled={isSummarizing}
-                              className="flex items-center gap-3 px-6 py-4 rounded-2xl font-black text-sm transition-all shadow-xl hover:-translate-y-1 bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white disabled:opacity-50"
-                            >
-                              {isSummarizing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Sparkles className="w-5 h-5" />}
-                              {isSummarizing ? t.summarizing : t.aiSummary}
-                            </button>
-                          )}
-                          <button 
-                            onClick={shareOrOpenWithWord}
-                            className="flex items-center gap-3 px-6 py-4 rounded-2xl font-black text-sm transition-all shadow-xl hover:-translate-y-1 bg-white dark:bg-slate-900 text-indigo-600 dark:text-indigo-400 border-2 border-indigo-100 dark:border-indigo-800"
-                          >
-                            <Share2 className="w-5 h-5" />
-                            {t.openWith}
-                          </button>
                           <button 
                             onClick={downloadAsWord}
                             className="flex items-center gap-3 px-6 py-4 rounded-2xl font-black text-sm transition-all shadow-xl hover:-translate-y-1 bg-gradient-to-r from-blue-600 to-indigo-700 text-white"
@@ -813,8 +726,7 @@ const App: React.FC = () => {
                           </button>
                           <button 
                             onClick={() => {
-                              const textToCopy = (aiSummary ? `Summary:\n${aiSummary}\n\n` : '') + ocrText;
-                              navigator.clipboard.writeText(textToCopy);
+                              navigator.clipboard.writeText(ocrText);
                               setCopied(true);
                               setTimeout(() => setCopied(false), 2000);
                             }}
@@ -1062,11 +974,11 @@ const App: React.FC = () => {
         )}
       </main>
 
-      <footer className="mt-10 border-t dark:border-slate-800 py-12 relative overflow-hidden bg-white/50 dark:bg-slate-900/50 glass">
-        <div className="max-w-7xl mx-auto px-6 grid grid-cols-1 md:grid-cols-4 gap-12 items-start">
-          <div className="md:col-span-1 space-y-5">
+      <footer className="mt-10 border-t dark:border-slate-800 py-10 relative overflow-hidden bg-white/50 dark:bg-slate-900/50 glass">
+        <div className="max-w-7xl mx-auto px-6 grid grid-cols-1 md:grid-cols-3 gap-8 items-center">
+          <div className="space-y-4">
             <div className="flex items-center gap-3">
-              <div className="bg-slate-900 dark:bg-white p-2.5 rounded-xl shadow-xl cursor-pointer" onClick={() => navigateTo('HOME')}>
+              <div className="bg-slate-900 dark:bg-white p-2 rounded-xl shadow-lg cursor-pointer" onClick={() => navigateTo('HOME')}>
                 <FileText className="text-white dark:text-slate-900 w-5 h-5" />
               </div>
               <h1 className="text-2xl font-black tracking-tighter cursor-pointer" onClick={() => navigateTo('HOME')}>
@@ -1075,45 +987,18 @@ const App: React.FC = () => {
                 </span>
               </h1>
             </div>
-            <p className="text-slate-400 dark:text-slate-500 font-medium leading-relaxed text-sm pr-4">
+            <p className="text-slate-400 dark:text-slate-500 font-medium leading-relaxed text-sm">
               বিশ্বসেরা পিডিএফ টুলকিট। নিরাপদ এবং ১০০% ফ্রি প্রসেসিং।
             </p>
           </div>
           
-          <div className="flex flex-col gap-4">
-             <h4 className="text-[10px] font-black uppercase tracking-[0.3em] text-indigo-600 dark:text-indigo-400">Navigation</h4>
-             <div className="flex flex-col gap-3 font-bold text-xs text-slate-400 dark:text-slate-500">
-               <button onClick={() => navigateTo('PRIVACY')} className="w-fit hover:text-indigo-600 transition-colors">{t.privacy}</button>
-               <button onClick={() => navigateTo('SAFETY')} className="w-fit hover:text-indigo-600 transition-colors">{t.safety}</button>
-               <button onClick={() => navigateTo('OPENSOURCE')} className="w-fit hover:text-indigo-600 transition-colors">{t.opensource}</button>
-             </div>
+          <div className="flex justify-center gap-8 font-black text-[10px] uppercase tracking-[0.2em] text-slate-400 dark:text-slate-600">
+            <button onClick={() => navigateTo('PRIVACY')} className="hover:text-indigo-600 transition-colors">{t.privacy}</button>
+            <button onClick={() => navigateTo('SAFETY')} className="hover:text-indigo-600 transition-colors">{t.safety}</button>
+            <button onClick={() => navigateTo('OPENSOURCE')} className="hover:text-indigo-600 transition-colors">{t.opensource}</button>
           </div>
 
-          <div className="flex flex-col gap-4">
-             <h4 className="text-[10px] font-black uppercase tracking-[0.3em] text-pink-600 dark:text-pink-400">Connect & Support</h4>
-             <div className="flex items-center gap-3">
-                <a href="mailto:gourobsaha2319@gmail.com" className="p-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500 hover:text-indigo-600 hover:bg-white dark:hover:bg-slate-700 transition-all shadow-sm border border-transparent hover:border-indigo-100" title="Email">
-                  <Mail className="w-5 h-5" />
-                </a>
-                <a href="https://www.linkedin.com/in/gourob-saha-9895442a9/" target="_blank" rel="noopener noreferrer" className="p-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500 hover:text-blue-600 hover:bg-white dark:hover:bg-slate-700 transition-all shadow-sm border border-transparent hover:border-blue-100" title="LinkedIn">
-                  <Linkedin className="w-5 h-5" />
-                </a>
-                <a href="https://facebook.com/profile.php?id=100093706797985" target="_blank" rel="noopener noreferrer" className="p-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500 hover:text-blue-700 hover:bg-white dark:hover:bg-slate-700 transition-all shadow-sm border border-transparent hover:border-blue-200" title="Facebook">
-                  <Facebook className="w-5 h-5" />
-                </a>
-             </div>
-             <a 
-               href="https://m.me/gourob23" 
-               target="_blank" 
-               rel="noopener noreferrer"
-               className="flex items-center gap-3 px-4 py-2.5 rounded-xl bg-gradient-to-r from-indigo-600 to-violet-600 text-white font-black text-[10px] uppercase tracking-widest shadow-lg hover:shadow-indigo-300 dark:shadow-none hover:-translate-y-1 transition-all w-fit"
-             >
-                <MessageSquareMore className="w-4 h-4" />
-                {t.suggestions}
-             </a>
-          </div>
-
-          <div className="flex flex-col items-center md:items-end gap-1.5 pt-4 md:pt-0">
+          <div className="flex flex-col items-center md:items-end gap-1">
             <div className="text-[9px] font-black uppercase tracking-[0.4em] text-slate-300 dark:text-slate-700">Developed With ❤️ In BD</div>
             <p className="text-slate-400 dark:text-slate-500 text-[10px] font-bold">
               © ২০২৫ {t.title} PRO.
