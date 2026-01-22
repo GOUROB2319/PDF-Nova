@@ -1,7 +1,7 @@
 
 import React, { useState, useRef, useEffect } from 'react';
 import { 
-  FileUp, Download, Image as ImageIcon, FileText, Settings, Trash2, 
+  FileUp, Download, ImageIcon, FileText, Settings, Trash2, 
   CheckCircle2, Loader2, AlertCircle, Layers, Info, 
   SlidersHorizontal, Scissors, Combine, Zap, ArrowLeft,
   ChevronRight, FilePlus, PlusCircle, Sun, Moon, Languages, Search,
@@ -86,7 +86,8 @@ const translations = {
     medium: 'মিডিয়াম',
     high: 'হাই',
     creatingPdf: 'পিডিএফ তৈরি হচ্ছে...',
-    shareDenied: 'সিকিউরিটি পলিসির কারণে সরাসরি অ্যাপ ওপেন করা সম্ভব হয়নি। ফাইলটি ডাউনলোড করুন।'
+    shareDenied: 'সিকিউরিটি পলিসির কারণে সরাসরি অ্যাপ ওপেন করা সম্ভব হয়নি। ফাইলটি ডাউনলোড করুন।',
+    ocrTip: 'টিপস: ঝকঝকে স্ক্যান করা পিডিএফ ব্যবহার করলে নির্ভুল টেক্সট পাওয়া যায়।'
   },
   en: {
     title: 'PDF Nova',
@@ -155,7 +156,8 @@ const translations = {
     medium: 'Medium',
     high: 'High',
     creatingPdf: 'Creating PDF...',
-    shareDenied: 'Could not open app due to security policy. Please use Download instead.'
+    shareDenied: 'Could not open app due to security policy. Please use Download instead.',
+    ocrTip: 'Tip: Use high-quality scanned PDFs for best accuracy.'
   }
 };
 
@@ -200,6 +202,38 @@ const App: React.FC = () => {
       document.documentElement.classList.remove('dark');
     }
   }, [darkMode]);
+
+  // Helper to enhance image for OCR
+  const enhanceImageForOCR = (canvas: HTMLCanvasElement) => {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const data = imageData.data;
+    
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i];
+      const g = data[i + 1];
+      const b = data[i + 2];
+      
+      // Grayscale calculation
+      const gray = 0.299 * r + 0.587 * g + 0.114 * b;
+      
+      // Basic contrast enhancement & binarization (soft thresholding)
+      let value = gray;
+      if (gray > 180) {
+        value = 255; // Whiten bright areas
+      } else if (gray < 100) {
+        value = 0; // Blacken dark areas
+      }
+      
+      data[i] = value;
+      data[i + 1] = value;
+      data[i + 2] = value;
+    }
+    
+    ctx.putImageData(imageData, 0, 0);
+  };
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFiles = Array.from(e.target.files || []) as File[];
@@ -262,20 +296,28 @@ const App: React.FC = () => {
     try {
       const arrayBuffer = await files[0].arrayBuffer();
       const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-      const numPages = Math.min(pdf.numPages, 15);
+      // Increased range limit to 20 for users
+      const numPages = Math.min(pdf.numPages, 20);
 
       for (let i = 1; i <= numPages; i++) {
         setStatusDetail(t.pageOf.replace('{current}', i.toString()).replace('{total}', numPages.toString()));
         const page = await pdf.getPage(i);
-        const viewport = page.getViewport({ scale: 2 });
+        
+        // Increased scale for better OCR accuracy (2.5 - 3 is optimal)
+        const viewport = page.getViewport({ scale: 2.8 });
         const canvas = document.createElement('canvas');
         const context = canvas.getContext('2d');
         canvas.height = viewport.height;
         canvas.width = viewport.width;
 
         await page.render({ canvasContext: context, viewport }).promise;
+        
+        // Apply image enhancement for better OCR
+        enhanceImageForOCR(canvas);
+        
         const imgData = canvas.toDataURL('image/png');
         
+        // OCR with combined Bengali and English support
         const result = await Tesseract.recognize(imgData, 'ben+eng', {
           logger: m => {
             if (m.status === 'recognizing text') {
@@ -285,14 +327,15 @@ const App: React.FC = () => {
           }
         });
 
-        fullExtractedText += `--- Page ${i} ---\n${result.data.text}\n\n`;
+        fullExtractedText += `--- Page ${i} ---\n${result.data.text.trim()}\n\n`;
       }
 
-      setOcrText(fullExtractedText);
+      setOcrText(fullExtractedText || t.noText);
       setStatus(ConversionStatus.COMPLETED);
       setProgress(100);
       setStatusDetail('');
     } catch (err) {
+      console.error(err);
       setError(t.error);
       setStatus(ConversionStatus.ERROR);
     }
@@ -336,7 +379,6 @@ const App: React.FC = () => {
 
     const file = new File([blob], 'extracted_text.doc', { type: 'application/msword' });
 
-    // Web Share API support check
     if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
       try {
         await navigator.share({
@@ -346,16 +388,14 @@ const App: React.FC = () => {
         });
       } catch (err: any) {
         console.error("Sharing failed:", err);
-        // Handle explicit "Permission denied" or "NotAllowedError"
         if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
           setError(t.shareDenied);
-          downloadAsWord(); // Fallback to download
+          downloadAsWord();
         } else if (err.name !== 'AbortError') {
           downloadAsWord();
         }
       }
     } else {
-      // Direct share not supported, use download fallback
       downloadAsWord();
     }
   };
@@ -721,6 +761,11 @@ const App: React.FC = () => {
 
                 {activeTool === 'OCR_PDF' && ocrText && (
                   <div className="space-y-8 animate-in slide-in-from-bottom-10 duration-700">
+                    <div className="p-6 bg-amber-50 dark:bg-amber-900/20 border-l-4 border-amber-400 rounded-xl flex items-center gap-4">
+                      <Info className="w-6 h-6 text-amber-500" />
+                      <p className="text-sm font-bold text-amber-800 dark:text-amber-200">{t.ocrTip}</p>
+                    </div>
+
                     {/* AI Summary Section */}
                     {aiSummary && (
                       <div className="bg-gradient-to-br from-indigo-600 to-violet-700 rounded-[3rem] p-10 shadow-2xl text-white relative overflow-hidden group">
