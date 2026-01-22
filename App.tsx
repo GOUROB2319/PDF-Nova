@@ -7,7 +7,8 @@ import {
   ChevronRight, FilePlus, PlusCircle, Sun, Moon, Languages, Search,
   Copy, ExternalLink, Sparkles, LayoutDashboard, ShieldCheck, ZapIcon,
   Lock, Heart, Code, Monitor, FileType, Share2, BrainCircuit,
-  Linkedin, Facebook, Mail, MessageCircle, Eye, Terminal
+  Linkedin, Facebook, Mail, MessageCircle, Eye, Terminal,
+  Maximize2, Minimize2
 } from 'lucide-react';
 import JSZip from 'jszip';
 import { PDFDocument } from 'pdf-lib';
@@ -73,6 +74,7 @@ const translations = {
     converting: 'ছবিতে রূপান্তর হচ্ছে...',
     merging: 'ফাইল এক করা হচ্ছে...',
     splitting: 'আলাদা করা হচ্ছে...',
+    compressing: 'কমপ্রেস করা হচ্ছে...',
     privacy: 'প্রাইভেসি পলিসি',
     safety: 'নিরাপত্তা',
     opensource: 'ওপেন সোর্স',
@@ -95,7 +97,9 @@ const translations = {
     sendSuggestion: 'পরামর্শ পাঠান',
     devWith: 'DEVELOPED WITH ❤️ IN BD',
     preview: 'প্রিভিউ',
-    generateAISummary: 'এআই দিয়ে সারসংক্ষেপ দেখুন'
+    generateAISummary: 'এআই দিয়ে সারসংক্ষেপ দেখুন',
+    compressLevel: 'কমপ্রেশন লেভেল',
+    copyrightYear: '২০২৬'
   },
   en: {
     title: 'PDF Nova',
@@ -150,6 +154,7 @@ const translations = {
     converting: 'Converting pages...',
     merging: 'Merging PDFs...',
     splitting: 'Splitting PDF...',
+    compressing: 'Compressing PDF...',
     privacy: 'Privacy Policy',
     safety: 'Safety',
     opensource: 'Open Source',
@@ -172,7 +177,9 @@ const translations = {
     sendSuggestion: 'Send Suggestion',
     devWith: 'DEVELOPED WITH ❤️ IN BD',
     preview: 'Preview',
-    generateAISummary: 'View AI Summary'
+    generateAISummary: 'View AI Summary',
+    compressLevel: 'Compression Level',
+    copyrightYear: '2026'
   }
 };
 
@@ -205,6 +212,8 @@ const App: React.FC = () => {
     dpi: 150,
     layout: 'fit'
   });
+
+  const [compressionLevel, setCompressionLevel] = useState(50); // 1-100
 
   const [splitRange, setSplitRange] = useState({ start: 1, end: 1 });
   const [maxPages, setMaxPages] = useState(1);
@@ -259,14 +268,13 @@ const App: React.FC = () => {
     setFiles(prev => [...prev, ...selectedFiles]);
     setError(null);
 
-    // Update metadata and generate previews
     if (activeTool !== 'IMAGE_TO_PDF') {
       for (const file of selectedFiles) {
         try {
           const previewUrl = await generatePreview(file);
           if (previewUrl) setPreviews(prev => [...prev, previewUrl]);
           
-          if (activeTool === 'SPLIT_PDF' || activeTool === 'PDF_TO_IMAGE' || activeTool === 'OCR_PDF') {
+          if (['SPLIT_PDF', 'PDF_TO_IMAGE', 'OCR_PDF', 'COMPRESS_PDF'].includes(activeTool as string)) {
             const arrayBuffer = await file.arrayBuffer();
             const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
             setMaxPages(pdf.numPages);
@@ -361,6 +369,53 @@ const App: React.FC = () => {
     } catch (err: any) {
       console.error(err);
       setError(err?.message || "Unknown error during OCR processing.");
+      setStatus(ConversionStatus.ERROR);
+    }
+  };
+
+  const processCompressPDF = async () => {
+    if (files.length === 0) return;
+    setStatus(ConversionStatus.PROCESSING);
+    setProgress(0);
+    setError(null);
+    setStatusDetail(t.compressing);
+
+    try {
+      const outPdf = await PDFDocument.create();
+      const arrayBuffer = await files[0].arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      const total = pdf.numPages;
+
+      // Lower quality = lower DPI
+      const scale = 0.5 + (compressionLevel / 100); // 0.5 to 1.5
+      const quality = compressionLevel / 100;
+
+      for (let i = 1; i <= total; i++) {
+        setStatusDetail(t.pageOf.replace('{current}', i.toString()).replace('{total}', total.toString()));
+        const page = await pdf.getPage(i);
+        const viewport = page.getViewport({ scale });
+        const canvas = document.createElement('canvas');
+        const context = canvas.getContext('2d');
+        canvas.height = viewport.height;
+        canvas.width = viewport.width;
+        await page.render({ canvasContext: context, viewport }).promise;
+        
+        const imgData = canvas.toDataURL('image/jpeg', quality);
+        const imageBytes = await fetch(imgData).then(res => res.arrayBuffer());
+        const pdfImage = await outPdf.embedJpg(imageBytes);
+        const newPage = outPdf.addPage([pdfImage.width, pdfImage.height]);
+        newPage.drawImage(pdfImage, { x: 0, y: 0, width: pdfImage.width, height: pdfImage.height });
+        
+        setProgress(Math.round((i / total) * 100));
+      }
+
+      const pdfBytes = await outPdf.save();
+      triggerDownload(new Blob([pdfBytes], { type: 'application/pdf' }), `compressed_${files[0].name}`);
+      setStatus(ConversionStatus.COMPLETED);
+      setStatusDetail('');
+    } catch (err: any) {
+      console.error(err);
+      setError(err?.message || "Compression failed.");
       setStatus(ConversionStatus.ERROR);
     }
   };
@@ -605,6 +660,7 @@ const App: React.FC = () => {
                 Professional <br/>
                 <span className="text-gradient underline decoration-indigo-200 dark:decoration-indigo-900 underline-offset-8">PDF Toolkit</span>
               </h2>
+              <h1 className="sr-only">{t.title}</h1>
               <p className="text-slate-500 dark:text-slate-400 text-xl font-medium max-w-2xl mx-auto leading-relaxed">
                 {t.heroDesc}
               </p>
@@ -734,7 +790,7 @@ const App: React.FC = () => {
                               <Trash2 className="w-6 h-6" />
                             </button>
                           </div>
-                          {activeTool === 'PDF_TO_IMAGE' && i === 0 && (
+                          {(activeTool === 'PDF_TO_IMAGE' || activeTool === 'COMPRESS_PDF') && i === 0 && (
                             <div className="pt-2">
                                 <button 
                                   onClick={handleAISummary}
@@ -865,6 +921,25 @@ const App: React.FC = () => {
                         </>
                       )}
 
+                      {activeTool === 'COMPRESS_PDF' && (
+                        <div className="space-y-8">
+                          <div className="flex justify-between items-center">
+                            <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em]">{t.compressLevel}</label>
+                            <span className="text-orange-600 dark:text-orange-400 font-black text-lg">{compressionLevel}%</span>
+                          </div>
+                          <input 
+                            type="range" min="10" max="95" step="5" 
+                            value={compressionLevel}
+                            onChange={(e) => setCompressionLevel(parseInt(e.target.value))}
+                            className="w-full h-3 bg-slate-100 dark:bg-slate-900 rounded-full appearance-none cursor-pointer accent-orange-500 dark:accent-orange-400" 
+                          />
+                          <div className="flex justify-between text-[10px] font-black uppercase tracking-widest text-slate-400">
+                             <span>Small Size</span>
+                             <span>Better Quality</span>
+                          </div>
+                        </div>
+                      )}
+
                       {activeTool === 'IMAGE_TO_PDF' && (
                         <>
                           <div className="space-y-5">
@@ -965,6 +1040,7 @@ const App: React.FC = () => {
                           else if (activeTool === 'IMAGE_TO_PDF') processImageToPDF();
                           else if (activeTool === 'MERGE_PDF') processMergePDF();
                           else if (activeTool === 'SPLIT_PDF') processSplitPDF();
+                          else if (activeTool === 'COMPRESS_PDF') processCompressPDF();
                         }}
                         className={`w-full bg-gradient-to-r ${toolList.find(t => t.id === activeTool)?.gradient} text-white py-8 rounded-[3rem] font-black text-2xl shadow-2xl transition-all hover:-translate-y-2 active:scale-95 flex items-center justify-center gap-5 group/btn`}
                       >
@@ -1098,7 +1174,7 @@ const App: React.FC = () => {
             <div className="space-y-6 lg:text-right">
               <div className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-400 dark:text-slate-600">{t.devWith}</div>
               <p className="text-slate-400 dark:text-slate-500 text-[10px] font-bold">
-                © ২০২৫ {t.title} PRO. <br/> 
+                © {t.copyrightYear} {t.title} PRO. <br/> 
                 <span className="opacity-50 mt-1 inline-block">All Rights Reserved</span>
               </p>
             </div>
