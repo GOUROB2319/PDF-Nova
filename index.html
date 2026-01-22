@@ -8,6 +8,13 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@300;400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <script>
+        // Shim for process.env to prevent "process is not defined" error in browser
+        window.process = {
+            env: {
+                API_KEY: "" // This will be injected by the environment or replaced during build
+            }
+        };
+
         tailwind.config = {
             darkMode: 'class',
             theme: {
@@ -85,7 +92,11 @@
     <div id="root"></div>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
     <script>
-        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+        if (typeof pdfjsLib !== 'undefined') {
+            pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+        }
     </script>
+    <!-- Note: In a production environment like Netlify, index.tsx must be compiled to index.js -->
+    <script type="module" src="./index.tsx"></script>
 </body>
 </html>

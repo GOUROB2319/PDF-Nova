@@ -6,12 +6,13 @@ import {
   SlidersHorizontal, Scissors, Combine, Zap, ArrowLeft,
   ChevronRight, FilePlus, PlusCircle, Sun, Moon, Languages, Search,
   Copy, ExternalLink, Sparkles, LayoutDashboard, ShieldCheck, ZapIcon,
-  Lock, Heart, Code, Monitor, FileType
+  Lock, Heart, Code, Monitor, FileType, Share2, BrainCircuit
 } from 'lucide-react';
 import JSZip from 'jszip';
 import { PDFDocument, PageSizes } from 'pdf-lib';
 import Tesseract from 'tesseract.js';
 import { ConversionStatus, ToolType, FileMetadata, ConversionConfig, PDFOutputConfig } from './types';
+import { getPDFSummary } from './services/geminiService';
 
 declare const pdfjsLib: any;
 
@@ -55,7 +56,10 @@ const translations = {
     ocrResult: 'এক্সট্রাক্টেড টেক্সট',
     noText: 'কোনো টেক্সট পাওয়া যায়নি।',
     copy: 'টেক্সট কপি করুন',
-    downloadWord: 'ওয়ার্ড ফাইল ডাউনলোড',
+    downloadWord: 'ওয়ার্ড ডাউনলোড',
+    openWith: 'অ্যাপ দিয়ে ওপেন করুন',
+    aiSummary: 'এআই সারসংক্ষেপ',
+    summarizing: 'সারসংক্ষেপ তৈরি হচ্ছে...',
     copied: 'কপি হয়েছে!',
     unlimited: 'আনলিমিটেড ফ্রি প্রসেসিং',
     secureDesc: 'সম্পূর্ণ প্রাইভেট। আপনার ফাইল ব্রাউজারেই প্রসেস হয়।',
@@ -81,7 +85,8 @@ const translations = {
     low: 'লো',
     medium: 'মিডিয়াম',
     high: 'হাই',
-    creatingPdf: 'পিডিএফ তৈরি হচ্ছে...'
+    creatingPdf: 'পিডিএফ তৈরি হচ্ছে...',
+    shareDenied: 'সিকিউরিটি পলিসির কারণে সরাসরি অ্যাপ ওপেন করা সম্ভব হয়নি। ফাইলটি ডাউনলোড করুন।'
   },
   en: {
     title: 'PDF Nova',
@@ -120,7 +125,10 @@ const translations = {
     ocrResult: 'Extracted Text',
     noText: 'No text found.',
     copy: 'Copy Text',
-    downloadWord: 'Download Word File',
+    downloadWord: 'Download Word',
+    openWith: 'Open with App',
+    aiSummary: 'AI Summary',
+    summarizing: 'Generating summary...',
     copied: 'Copied!',
     unlimited: 'Unlimited Free Processing',
     secureDesc: 'Completely private. Files stay in your browser.',
@@ -146,7 +154,8 @@ const translations = {
     low: 'Low',
     medium: 'Medium',
     high: 'High',
-    creatingPdf: 'Creating PDF...'
+    creatingPdf: 'Creating PDF...',
+    shareDenied: 'Could not open app due to security policy. Please use Download instead.'
   }
 };
 
@@ -163,6 +172,8 @@ const App: React.FC = () => {
   const [statusDetail, setStatusDetail] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [ocrText, setOcrText] = useState<string | null>(null);
+  const [aiSummary, setAiSummary] = useState<string | null>(null);
+  const [isSummarizing, setIsSummarizing] = useState(false);
   const [copied, setCopied] = useState(false);
 
   const [imageConfig, setImageConfig] = useState<ConversionConfig>({
@@ -227,6 +238,7 @@ const App: React.FC = () => {
     setFiles(prev => prev.filter((_, i) => i !== index));
     if (files.length <= 1) {
       setOcrText(null);
+      setAiSummary(null);
       setMaxPages(1);
       setSplitRange({ start: 1, end: 1 });
     }
@@ -286,20 +298,66 @@ const App: React.FC = () => {
     }
   };
 
-  const downloadAsWord = () => {
+  const generateSummary = async () => {
     if (!ocrText) return;
+    setIsSummarizing(true);
+    try {
+      const summary = await getPDFSummary(ocrText);
+      setAiSummary(summary);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsSummarizing(false);
+    }
+  };
+
+  const getWordBlob = () => {
+    if (!ocrText) return null;
     const header = "<html xmlns:o='urn:schemas-microsoft-com:office:office' "+
           "xmlns:w='urn:schemas-microsoft-com:office:word' "+
           "xmlns='http://www.w3.org/TR/REC-html40'>"+
           "<head><meta charset='utf-8'><title>Export Word</title><style>body { font-family: 'Inter', 'Hind Siliguri', sans-serif; }</style></head><body>";
     const footer = "</body></html>";
-    const sourceHTML = header + ocrText.replace(/\n/g, '<br>') + footer;
+    const sourceHTML = header + (aiSummary ? `<h2>Summary</h2><p>${aiSummary.replace(/\n/g, '<br>')}</p><hr>` : '') + ocrText.replace(/\n/g, '<br>') + footer;
     
-    const blob = new Blob(['\ufeff', sourceHTML], {
+    return new Blob(['\ufeff', sourceHTML], {
       type: 'application/msword'
     });
-    
-    triggerDownload(blob, 'extracted_text.doc');
+  };
+
+  const downloadAsWord = () => {
+    const blob = getWordBlob();
+    if (blob) triggerDownload(blob, 'extracted_text.doc');
+  };
+
+  const shareOrOpenWithWord = async () => {
+    const blob = getWordBlob();
+    if (!blob) return;
+
+    const file = new File([blob], 'extracted_text.doc', { type: 'application/msword' });
+
+    // Web Share API support check
+    if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
+      try {
+        await navigator.share({
+          files: [file],
+          title: 'Extracted PDF Text',
+          text: 'PDF OCR Result'
+        });
+      } catch (err: any) {
+        console.error("Sharing failed:", err);
+        // Handle explicit "Permission denied" or "NotAllowedError"
+        if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
+          setError(t.shareDenied);
+          downloadAsWord(); // Fallback to download
+        } else if (err.name !== 'AbortError') {
+          downloadAsWord();
+        }
+      }
+    } else {
+      // Direct share not supported, use download fallback
+      downloadAsWord();
+    }
   };
 
   const processPDFToImage = async () => {
@@ -424,14 +482,15 @@ const App: React.FC = () => {
     setProgress(50);
     try {
       const bytes = await files[0].arrayBuffer();
-      const pdf = await PDFDocument.load(bytes);
+      const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
       const splitPdf = await PDFDocument.create();
       
       const start = Math.max(1, splitRange.start);
-      const end = Math.min(pdf.getPageCount(), splitRange.end);
+      const end = Math.min(pdf.numPages, splitRange.end);
       const indices = Array.from({ length: end - start + 1 }, (_, i) => i + start - 1);
       
-      const copiedPages = await splitPdf.copyPages(pdf, indices);
+      const sourcePdfDoc = await PDFDocument.load(bytes);
+      const copiedPages = await splitPdf.copyPages(sourcePdfDoc, indices);
       copiedPages.forEach(page => splitPdf.addPage(page));
       
       const splitBytes = await splitPdf.save();
@@ -449,6 +508,7 @@ const App: React.FC = () => {
     setStatusDetail('');
     setError(null);
     setOcrText(null);
+    setAiSummary(null);
     setMaxPages(1);
     setSplitRange({ start: 1, end: 1 });
   };
@@ -626,7 +686,7 @@ const App: React.FC = () => {
                         <div className="bg-gradient-to-r from-indigo-600 to-pink-600 w-24 h-24 rounded-3xl shadow-2xl shadow-indigo-300/40 dark:shadow-none flex items-center justify-center mx-auto mb-10 group-hover:scale-110 group-hover:rotate-12 transition-all">
                           <FileUp className="w-12 h-12 text-white" />
                         </div>
-                        <h4 className="text-3xl font-black mb-3 dark:text-white tracking-tight">{t.upload}</h4>
+                        <h4 className="text-3xl font-black mb-3 text-slate-800 dark:text-white tracking-tight">{t.upload}</h4>
                         <p className="text-slate-400 dark:text-slate-500 font-bold tracking-wide">{t.dragDrop}</p>
                       </div>
                     </div>
@@ -660,42 +720,80 @@ const App: React.FC = () => {
                 </div>
 
                 {activeTool === 'OCR_PDF' && ocrText && (
-                  <div className="bg-white/80 dark:bg-slate-800/80 glass rounded-[3rem] p-12 shadow-2xl animate-in slide-in-from-bottom-10 duration-700">
-                    <div className="flex items-center justify-between mb-10 flex-wrap gap-4">
-                      <div className="flex items-center gap-4">
-                        <div className="p-4 rounded-2xl bg-violet-100 dark:bg-violet-900/30 text-violet-600">
-                           <Copy className="w-7 h-7" />
+                  <div className="space-y-8 animate-in slide-in-from-bottom-10 duration-700">
+                    {/* AI Summary Section */}
+                    {aiSummary && (
+                      <div className="bg-gradient-to-br from-indigo-600 to-violet-700 rounded-[3rem] p-10 shadow-2xl text-white relative overflow-hidden group">
+                        <div className="absolute top-0 right-0 w-64 h-64 bg-white/10 rounded-full blur-3xl -mr-32 -mt-32"></div>
+                        <div className="relative z-10 space-y-6">
+                           <div className="flex items-center gap-4">
+                              <div className="bg-white/20 p-4 rounded-2xl backdrop-blur-md">
+                                 <BrainCircuit className="w-8 h-8 text-white" />
+                              </div>
+                              <h4 className="text-3xl font-black tracking-tighter">{t.aiSummary}</h4>
+                           </div>
+                           <p className="text-lg font-medium leading-relaxed text-indigo-50">
+                             {aiSummary}
+                           </p>
                         </div>
-                        <h4 className="text-3xl font-black dark:text-white tracking-tighter">{t.ocrResult}</h4>
                       </div>
-                      <div className="flex items-center gap-3">
-                        <button 
-                          onClick={downloadAsWord}
-                          className="flex items-center gap-3 px-8 py-4 rounded-2xl font-black text-sm transition-all shadow-xl hover:-translate-y-1 bg-gradient-to-r from-blue-600 to-indigo-700 text-white"
-                        >
-                          <FileType className="w-5 h-5" />
-                          {t.downloadWord}
-                        </button>
-                        <button 
-                          onClick={() => {
-                            navigator.clipboard.writeText(ocrText);
-                            setCopied(true);
-                            setTimeout(() => setCopied(false), 2000);
-                          }}
-                          className={`flex items-center gap-3 px-8 py-4 rounded-2xl font-black text-sm transition-all shadow-xl hover:-translate-y-1 ${copied ? 'bg-emerald-500 text-white' : 'bg-slate-900 dark:bg-white dark:text-slate-900 text-white hover:bg-indigo-600 dark:hover:bg-indigo-400'}`}
-                        >
-                          {copied ? <CheckCircle2 className="w-5 h-5" /> : <ExternalLink className="w-5 h-5" />}
-                          {copied ? t.copied : t.copy}
-                        </button>
+                    )}
+
+                    <div className="bg-white/80 dark:bg-slate-800/80 glass rounded-[3rem] p-12 shadow-2xl">
+                      <div className="flex items-center justify-between mb-10 flex-wrap gap-4">
+                        <div className="flex items-center gap-4">
+                          <div className="p-4 rounded-2xl bg-violet-100 dark:bg-violet-900/30 text-violet-600">
+                             <FileType className="w-7 h-7" />
+                          </div>
+                          <h4 className="text-3xl font-black dark:text-white tracking-tighter">{t.ocrResult}</h4>
+                        </div>
+                        <div className="flex items-center gap-3 flex-wrap">
+                          {!aiSummary && (
+                            <button 
+                              onClick={generateSummary}
+                              disabled={isSummarizing}
+                              className="flex items-center gap-3 px-6 py-4 rounded-2xl font-black text-sm transition-all shadow-xl hover:-translate-y-1 bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white disabled:opacity-50"
+                            >
+                              {isSummarizing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Sparkles className="w-5 h-5" />}
+                              {isSummarizing ? t.summarizing : t.aiSummary}
+                            </button>
+                          )}
+                          <button 
+                            onClick={shareOrOpenWithWord}
+                            className="flex items-center gap-3 px-6 py-4 rounded-2xl font-black text-sm transition-all shadow-xl hover:-translate-y-1 bg-white dark:bg-slate-900 text-indigo-600 dark:text-indigo-400 border-2 border-indigo-100 dark:border-indigo-800"
+                          >
+                            <Share2 className="w-5 h-5" />
+                            {t.openWith}
+                          </button>
+                          <button 
+                            onClick={downloadAsWord}
+                            className="flex items-center gap-3 px-6 py-4 rounded-2xl font-black text-sm transition-all shadow-xl hover:-translate-y-1 bg-gradient-to-r from-blue-600 to-indigo-700 text-white"
+                          >
+                            <Download className="w-5 h-5" />
+                            {t.downloadWord}
+                          </button>
+                          <button 
+                            onClick={() => {
+                              const textToCopy = (aiSummary ? `Summary:\n${aiSummary}\n\n` : '') + ocrText;
+                              navigator.clipboard.writeText(textToCopy);
+                              setCopied(true);
+                              setTimeout(() => setCopied(false), 2000);
+                            }}
+                            className={`flex items-center gap-3 px-6 py-4 rounded-2xl font-black text-sm transition-all shadow-xl hover:-translate-y-1 ${copied ? 'bg-emerald-500 text-white' : 'bg-slate-900 dark:bg-white dark:text-slate-900 text-white hover:bg-indigo-600 dark:hover:bg-indigo-400'}`}
+                          >
+                            {copied ? <CheckCircle2 className="w-5 h-5" /> : <Copy className="w-5 h-5" />}
+                            {copied ? t.copied : t.copy}
+                          </button>
+                        </div>
                       </div>
-                    </div>
-                    <div className="relative">
-                      <div className="absolute -top-4 -left-4 w-20 h-20 bg-violet-500 opacity-10 blur-2xl"></div>
-                      <textarea 
-                        readOnly 
-                        value={ocrText}
-                        className="w-full h-[600px] bg-slate-50/50 dark:bg-slate-900/50 border dark:border-slate-700/50 rounded-[2.5rem] p-10 text-slate-700 dark:text-slate-300 font-mono text-lg leading-relaxed shadow-inner focus:outline-none focus:ring-4 focus:ring-indigo-500/10 transition-all custom-scrollbar"
-                      />
+                      <div className="relative">
+                        <div className="absolute -top-4 -left-4 w-20 h-20 bg-violet-500 opacity-10 blur-2xl"></div>
+                        <textarea 
+                          readOnly 
+                          value={ocrText}
+                          className="w-full h-[600px] bg-slate-50/50 dark:bg-slate-900/50 border dark:border-slate-700/50 rounded-[2.5rem] p-10 text-slate-700 dark:text-slate-300 font-mono text-lg leading-relaxed shadow-inner focus:outline-none focus:ring-4 focus:ring-indigo-500/10 transition-all custom-scrollbar"
+                        />
+                      </div>
                     </div>
                   </div>
                 )}
@@ -871,6 +969,7 @@ const App: React.FC = () => {
                       <div className="p-8 bg-rose-50 dark:bg-rose-900/20 border-2 border-rose-100 dark:border-rose-800/20 rounded-[2.5rem] flex items-start gap-4 text-rose-600 dark:text-rose-400 text-sm font-bold shadow-xl animate-in shake duration-500">
                         <AlertCircle className="w-7 h-7 shrink-0" />
                         <span className="leading-relaxed">{error}</span>
+                        <button onClick={() => setError(null)} className="ml-auto p-2 opacity-50 hover:opacity-100 transition-opacity">×</button>
                       </div>
                     )}
                   </div>
