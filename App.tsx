@@ -6,7 +6,8 @@ import {
   SlidersHorizontal, Scissors, Combine, Zap, ArrowLeft,
   ChevronRight, FilePlus, PlusCircle, Sun, Moon, Languages, Search,
   Copy, ExternalLink, Sparkles, LayoutDashboard, ShieldCheck, ZapIcon,
-  Lock, Heart, Code, Monitor, FileType, Share2, BrainCircuit
+  Lock, Heart, Code, Monitor, FileType, Share2, BrainCircuit,
+  Facebook, Linkedin, Mail, MessageSquareMore
 } from 'lucide-react';
 import JSZip from 'jszip';
 import { PDFDocument, PageSizes } from 'pdf-lib';
@@ -87,7 +88,8 @@ const translations = {
     high: 'হাই',
     creatingPdf: 'পিডিএফ তৈরি হচ্ছে...',
     shareDenied: 'সিকিউরিটি পলিসির কারণে সরাসরি অ্যাপ ওপেন করা সম্ভব হয়নি। ফাইলটি ডাউনলোড করুন।',
-    ocrTip: 'টিপস: ঝকঝকে স্ক্যান করা পিডিএফ ব্যবহার করলে নির্ভুল টেক্সট পাওয়া যায়।'
+    ocrTip: 'টিপস: ঝকঝকে স্ক্যান করা পিডিএফ ব্যবহার করলে নির্ভুল টেক্সট পাওয়া যায়।',
+    suggestions: 'পরামর্শ পাঠান'
   },
   en: {
     title: 'PDF Nova',
@@ -157,7 +159,8 @@ const translations = {
     high: 'High',
     creatingPdf: 'Creating PDF...',
     shareDenied: 'Could not open app due to security policy. Please use Download instead.',
-    ocrTip: 'Tip: Use high-quality scanned PDFs for best accuracy.'
+    ocrTip: 'Tip: Use high-quality scanned PDFs for best accuracy.',
+    suggestions: 'Send Feedback'
   }
 };
 
@@ -216,15 +219,13 @@ const App: React.FC = () => {
       const g = data[i + 1];
       const b = data[i + 2];
       
-      // Grayscale calculation
       const gray = 0.299 * r + 0.587 * g + 0.114 * b;
       
-      // Basic contrast enhancement & binarization (soft thresholding)
       let value = gray;
       if (gray > 180) {
-        value = 255; // Whiten bright areas
+        value = 255; 
       } else if (gray < 100) {
-        value = 0; // Blacken dark areas
+        value = 0; 
       }
       
       data[i] = value;
@@ -296,14 +297,12 @@ const App: React.FC = () => {
     try {
       const arrayBuffer = await files[0].arrayBuffer();
       const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-      // Increased range limit to 20 for users
       const numPages = Math.min(pdf.numPages, 20);
 
       for (let i = 1; i <= numPages; i++) {
         setStatusDetail(t.pageOf.replace('{current}', i.toString()).replace('{total}', numPages.toString()));
         const page = await pdf.getPage(i);
         
-        // Increased scale for better OCR accuracy (2.5 - 3 is optimal)
         const viewport = page.getViewport({ scale: 2.8 });
         const canvas = document.createElement('canvas');
         const context = canvas.getContext('2d');
@@ -311,13 +310,9 @@ const App: React.FC = () => {
         canvas.width = viewport.width;
 
         await page.render({ canvasContext: context, viewport }).promise;
-        
-        // Apply image enhancement for better OCR
         enhanceImageForOCR(canvas);
-        
         const imgData = canvas.toDataURL('image/png');
         
-        // OCR with combined Bengali and English support
         const result = await Tesseract.recognize(imgData, 'ben+eng', {
           logger: m => {
             if (m.status === 'recognizing text') {
@@ -766,7 +761,6 @@ const App: React.FC = () => {
                       <p className="text-sm font-bold text-amber-800 dark:text-amber-200">{t.ocrTip}</p>
                     </div>
 
-                    {/* AI Summary Section */}
                     {aiSummary && (
                       <div className="bg-gradient-to-br from-indigo-600 to-violet-700 rounded-[3rem] p-10 shadow-2xl text-white relative overflow-hidden group">
                         <div className="absolute top-0 right-0 w-64 h-64 bg-white/10 rounded-full blur-3xl -mr-32 -mt-32"></div>
@@ -1068,33 +1062,60 @@ const App: React.FC = () => {
         )}
       </main>
 
-      <footer className="mt-20 border-t dark:border-slate-800 py-20 relative overflow-hidden bg-white/50 dark:bg-slate-900/50 glass">
-        <div className="max-w-7xl mx-auto px-6 grid grid-cols-1 md:grid-cols-3 gap-16 items-center">
-          <div className="space-y-6">
-            <div className="flex items-center gap-4">
-              <div className="bg-slate-900 dark:bg-white p-3 rounded-2xl shadow-xl cursor-pointer" onClick={() => navigateTo('HOME')}>
-                <FileText className="text-white dark:text-slate-900 w-6 h-6" />
+      <footer className="mt-10 border-t dark:border-slate-800 py-12 relative overflow-hidden bg-white/50 dark:bg-slate-900/50 glass">
+        <div className="max-w-7xl mx-auto px-6 grid grid-cols-1 md:grid-cols-4 gap-12 items-start">
+          <div className="md:col-span-1 space-y-5">
+            <div className="flex items-center gap-3">
+              <div className="bg-slate-900 dark:bg-white p-2.5 rounded-xl shadow-xl cursor-pointer" onClick={() => navigateTo('HOME')}>
+                <FileText className="text-white dark:text-slate-900 w-5 h-5" />
               </div>
-              <h1 className="text-3xl font-black tracking-tighter cursor-pointer" onClick={() => navigateTo('HOME')}>
+              <h1 className="text-2xl font-black tracking-tighter cursor-pointer" onClick={() => navigateTo('HOME')}>
                 <span className="text-gradient">
                   {t.title}
                 </span>
               </h1>
             </div>
-            <p className="text-slate-400 dark:text-slate-500 font-medium leading-relaxed">
+            <p className="text-slate-400 dark:text-slate-500 font-medium leading-relaxed text-sm pr-4">
               বিশ্বসেরা পিডিএফ টুলকিট। নিরাপদ এবং ১০০% ফ্রি প্রসেসিং।
             </p>
           </div>
           
-          <div className="flex justify-center gap-12 font-black text-xs uppercase tracking-[0.3em] text-slate-400 dark:text-slate-600">
-            <button onClick={() => navigateTo('PRIVACY')} className="hover:text-indigo-600 transition-colors">{t.privacy}</button>
-            <button onClick={() => navigateTo('SAFETY')} className="hover:text-indigo-600 transition-colors">{t.safety}</button>
-            <button onClick={() => navigateTo('OPENSOURCE')} className="hover:text-indigo-600 transition-colors">{t.opensource}</button>
+          <div className="flex flex-col gap-4">
+             <h4 className="text-[10px] font-black uppercase tracking-[0.3em] text-indigo-600 dark:text-indigo-400">Navigation</h4>
+             <div className="flex flex-col gap-3 font-bold text-xs text-slate-400 dark:text-slate-500">
+               <button onClick={() => navigateTo('PRIVACY')} className="w-fit hover:text-indigo-600 transition-colors">{t.privacy}</button>
+               <button onClick={() => navigateTo('SAFETY')} className="w-fit hover:text-indigo-600 transition-colors">{t.safety}</button>
+               <button onClick={() => navigateTo('OPENSOURCE')} className="w-fit hover:text-indigo-600 transition-colors">{t.opensource}</button>
+             </div>
           </div>
 
-          <div className="flex flex-col items-center md:items-end gap-2">
-            <div className="text-[10px] font-black uppercase tracking-[0.5em] text-slate-300 dark:text-slate-700 mb-2">Developed With ❤️ In BD</div>
-            <p className="text-slate-400 dark:text-slate-500 text-xs font-bold">
+          <div className="flex flex-col gap-4">
+             <h4 className="text-[10px] font-black uppercase tracking-[0.3em] text-pink-600 dark:text-pink-400">Connect & Support</h4>
+             <div className="flex items-center gap-3">
+                <a href="mailto:gourobsaha2319@gmail.com" className="p-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500 hover:text-indigo-600 hover:bg-white dark:hover:bg-slate-700 transition-all shadow-sm border border-transparent hover:border-indigo-100" title="Email">
+                  <Mail className="w-5 h-5" />
+                </a>
+                <a href="https://www.linkedin.com/in/gourob-saha-9895442a9/" target="_blank" rel="noopener noreferrer" className="p-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500 hover:text-blue-600 hover:bg-white dark:hover:bg-slate-700 transition-all shadow-sm border border-transparent hover:border-blue-100" title="LinkedIn">
+                  <Linkedin className="w-5 h-5" />
+                </a>
+                <a href="https://facebook.com/profile.php?id=100093706797985" target="_blank" rel="noopener noreferrer" className="p-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500 hover:text-blue-700 hover:bg-white dark:hover:bg-slate-700 transition-all shadow-sm border border-transparent hover:border-blue-200" title="Facebook">
+                  <Facebook className="w-5 h-5" />
+                </a>
+             </div>
+             <a 
+               href="https://m.me/gourob23" 
+               target="_blank" 
+               rel="noopener noreferrer"
+               className="flex items-center gap-3 px-4 py-2.5 rounded-xl bg-gradient-to-r from-indigo-600 to-violet-600 text-white font-black text-[10px] uppercase tracking-widest shadow-lg hover:shadow-indigo-300 dark:shadow-none hover:-translate-y-1 transition-all w-fit"
+             >
+                <MessageSquareMore className="w-4 h-4" />
+                {t.suggestions}
+             </a>
+          </div>
+
+          <div className="flex flex-col items-center md:items-end gap-1.5 pt-4 md:pt-0">
+            <div className="text-[9px] font-black uppercase tracking-[0.4em] text-slate-300 dark:text-slate-700">Developed With ❤️ In BD</div>
+            <p className="text-slate-400 dark:text-slate-500 text-[10px] font-bold">
               © ২০২৫ {t.title} PRO.
             </p>
           </div>
