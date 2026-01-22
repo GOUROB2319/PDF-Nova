@@ -6,7 +6,7 @@ import {
   SlidersHorizontal, Scissors, Combine, Zap, ArrowLeft,
   ChevronRight, FilePlus, PlusCircle, Sun, Moon, Languages, Search,
   Copy, ExternalLink, Sparkles, LayoutDashboard, ShieldCheck, ZapIcon,
-  Lock, Heart, Code, Monitor
+  Lock, Heart, Code, Monitor, FileType
 } from 'lucide-react';
 import JSZip from 'jszip';
 import { PDFDocument, PageSizes } from 'pdf-lib';
@@ -19,7 +19,7 @@ type ViewType = 'HOME' | 'TOOL' | 'PRIVACY' | 'SAFETY' | 'OPENSOURCE';
 
 const translations = {
   bn: {
-    title: 'পিডিএফ মাস্টার প্রো',
+    title: 'পিডিএফ নোভা',
     subtitle: 'নিরাপদ, দ্রুত এবং শক্তিশালী পিডিএফ টুলকিট',
     heroDesc: 'সহজেই পিডিএফ কনভার্ট, মার্জ, স্প্লিট এবং OCR করুন সরাসরি আপনার ব্রাউজারে। কোনো ডেটা আমাদের সার্ভারে যায় না।',
     dashboard: 'ড্যাশবোর্ড',
@@ -55,6 +55,7 @@ const translations = {
     ocrResult: 'এক্সট্রাক্টেড টেক্সট',
     noText: 'কোনো টেক্সট পাওয়া যায়নি।',
     copy: 'টেক্সট কপি করুন',
+    downloadWord: 'ওয়ার্ড ফাইল ডাউনলোড',
     copied: 'কপি হয়েছে!',
     unlimited: 'আনলিমিটেড ফ্রি প্রসেসিং',
     secureDesc: 'সম্পূর্ণ প্রাইভেট। আপনার ফাইল ব্রাউজারেই প্রসেস হয়।',
@@ -83,7 +84,7 @@ const translations = {
     creatingPdf: 'পিডিএফ তৈরি হচ্ছে...'
   },
   en: {
-    title: 'PDF Master Pro',
+    title: 'PDF Nova',
     subtitle: 'Secure, Fast & Powerful PDF Toolkit',
     heroDesc: 'Easily convert, merge, split, and OCR PDFs directly in your browser. No server logs, 100% private.',
     dashboard: 'Dashboard',
@@ -119,6 +120,7 @@ const translations = {
     ocrResult: 'Extracted Text',
     noText: 'No text found.',
     copy: 'Copy Text',
+    downloadWord: 'Download Word File',
     copied: 'Copied!',
     unlimited: 'Unlimited Free Processing',
     secureDesc: 'Completely private. Files stay in your browser.',
@@ -284,6 +286,22 @@ const App: React.FC = () => {
     }
   };
 
+  const downloadAsWord = () => {
+    if (!ocrText) return;
+    const header = "<html xmlns:o='urn:schemas-microsoft-com:office:office' "+
+          "xmlns:w='urn:schemas-microsoft-com:office:word' "+
+          "xmlns='http://www.w3.org/TR/REC-html40'>"+
+          "<head><meta charset='utf-8'><title>Export Word</title><style>body { font-family: 'Inter', 'Hind Siliguri', sans-serif; }</style></head><body>";
+    const footer = "</body></html>";
+    const sourceHTML = header + ocrText.replace(/\n/g, '<br>') + footer;
+    
+    const blob = new Blob(['\ufeff', sourceHTML], {
+      type: 'application/msword'
+    });
+    
+    triggerDownload(blob, 'extracted_text.doc');
+  };
+
   const processPDFToImage = async () => {
     if (files.length === 0) return;
     setStatus(ConversionStatus.PROCESSING);
@@ -334,7 +352,6 @@ const App: React.FC = () => {
         const file = files[i];
         setStatusDetail(t.pageOf.replace('{current}', (i + 1).toString()).replace('{total}', files.length.toString()));
         
-        // Load image and compress using canvas
         const img = await new Promise<HTMLImageElement>((resolve, reject) => {
           const reader = new FileReader();
           reader.onload = () => {
@@ -348,8 +365,6 @@ const App: React.FC = () => {
 
         const canvas = document.createElement('canvas');
         const ctx = canvas.getContext('2d');
-        // Simple DPI scaling logic for canvas size
-        const scaleFactor = pdfOutputConfig.dpi / 72;
         canvas.width = img.width;
         canvas.height = img.height;
         ctx?.drawImage(img, 0, 0);
@@ -357,13 +372,7 @@ const App: React.FC = () => {
         const compressedDataUrl = canvas.toDataURL('image/jpeg', quality);
         const imageBytes = await fetch(compressedDataUrl).then(res => res.arrayBuffer());
         
-        let pdfImage;
-        if (file.type === 'image/png') {
-            // Check if we should keep PNG or convert all to JPEG for size
-            pdfImage = await pdfDoc.embedJpg(imageBytes);
-        } else {
-            pdfImage = await pdfDoc.embedJpg(imageBytes);
-        }
+        let pdfImage = await pdfDoc.embedJpg(imageBytes);
 
         const page = pdfDoc.addPage([pdfImage.width, pdfImage.height]);
         page.drawImage(pdfImage, {
@@ -652,24 +661,33 @@ const App: React.FC = () => {
 
                 {activeTool === 'OCR_PDF' && ocrText && (
                   <div className="bg-white/80 dark:bg-slate-800/80 glass rounded-[3rem] p-12 shadow-2xl animate-in slide-in-from-bottom-10 duration-700">
-                    <div className="flex items-center justify-between mb-10">
+                    <div className="flex items-center justify-between mb-10 flex-wrap gap-4">
                       <div className="flex items-center gap-4">
                         <div className="p-4 rounded-2xl bg-violet-100 dark:bg-violet-900/30 text-violet-600">
                            <Copy className="w-7 h-7" />
                         </div>
                         <h4 className="text-3xl font-black dark:text-white tracking-tighter">{t.ocrResult}</h4>
                       </div>
-                      <button 
-                        onClick={() => {
-                          navigator.clipboard.writeText(ocrText);
-                          setCopied(true);
-                          setTimeout(() => setCopied(false), 2000);
-                        }}
-                        className={`flex items-center gap-3 px-8 py-4 rounded-2xl font-black text-sm transition-all shadow-xl hover:-translate-y-1 ${copied ? 'bg-emerald-500 text-white' : 'bg-slate-900 dark:bg-white dark:text-slate-900 text-white hover:bg-indigo-600 dark:hover:bg-indigo-400'}`}
-                      >
-                        {copied ? <CheckCircle2 className="w-5 h-5" /> : <ExternalLink className="w-5 h-5" />}
-                        {copied ? t.copied : t.copy}
-                      </button>
+                      <div className="flex items-center gap-3">
+                        <button 
+                          onClick={downloadAsWord}
+                          className="flex items-center gap-3 px-8 py-4 rounded-2xl font-black text-sm transition-all shadow-xl hover:-translate-y-1 bg-gradient-to-r from-blue-600 to-indigo-700 text-white"
+                        >
+                          <FileType className="w-5 h-5" />
+                          {t.downloadWord}
+                        </button>
+                        <button 
+                          onClick={() => {
+                            navigator.clipboard.writeText(ocrText);
+                            setCopied(true);
+                            setTimeout(() => setCopied(false), 2000);
+                          }}
+                          className={`flex items-center gap-3 px-8 py-4 rounded-2xl font-black text-sm transition-all shadow-xl hover:-translate-y-1 ${copied ? 'bg-emerald-500 text-white' : 'bg-slate-900 dark:bg-white dark:text-slate-900 text-white hover:bg-indigo-600 dark:hover:bg-indigo-400'}`}
+                        >
+                          {copied ? <CheckCircle2 className="w-5 h-5" /> : <ExternalLink className="w-5 h-5" />}
+                          {copied ? t.copied : t.copy}
+                        </button>
+                      </div>
                     </div>
                     <div className="relative">
                       <div className="absolute -top-4 -left-4 w-20 h-20 bg-violet-500 opacity-10 blur-2xl"></div>
