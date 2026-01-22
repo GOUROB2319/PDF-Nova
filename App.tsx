@@ -1,5 +1,5 @@
 
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { 
   FileUp, Download, ImageIcon, FileText, Settings, Trash2, 
   CheckCircle2, Loader2, AlertCircle, Layers, Info, 
@@ -19,6 +19,22 @@ import { getPDFSummary } from './services/geminiService';
 declare const pdfjsLib: any;
 
 type ViewType = 'HOME' | 'TOOL' | 'PRIVACY' | 'SAFETY' | 'OPENSOURCE';
+
+// Helper to convert Data URI to Uint8Array directly to avoid network stack overhead of fetch()
+const dataURItoUint8Array = (dataURI: string) => {
+  try {
+    const byteString = atob(dataURI.split(',')[1]);
+    const ab = new ArrayBuffer(byteString.length);
+    const ia = new Uint8Array(ab);
+    for (let i = 0; i < byteString.length; i++) {
+      ia[i] = byteString.charCodeAt(i);
+    }
+    return ia;
+  } catch (e) {
+    console.error("Error converting Data URI", e);
+    return new Uint8Array(0);
+  }
+};
 
 const translations = {
   bn: {
@@ -228,24 +244,31 @@ const App: React.FC = () => {
     }
   }, [darkMode]);
 
-  const generatePreview = async (file: File) => {
-    if (file.type !== 'application/pdf') return;
+  const generatePreview = useCallback(async (file: File) => {
+    if (file.type !== 'application/pdf') return null;
     try {
       const arrayBuffer = await file.arrayBuffer();
-      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      // Using loading task to potentially cancel if needed, though sequential here
+      const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+      const pdf = await loadingTask.promise;
       const page = await pdf.getPage(1);
-      const viewport = page.getViewport({ scale: 0.4 });
+      
+      // Thumbnail scale
+      const viewport = page.getViewport({ scale: 0.3 }); 
       const canvas = document.createElement('canvas');
       const context = canvas.getContext('2d');
       canvas.height = viewport.height;
       canvas.width = viewport.width;
+      
       await page.render({ canvasContext: context, viewport }).promise;
+      // Convert to blob to be memory efficient if logic supported it, 
+      // but sticking to dataURL for compatibility with existing state structure
       return canvas.toDataURL();
     } catch (err: any) {
       console.error("Preview failed:", err);
       return null;
     }
-  };
+  }, []);
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFiles = Array.from(e.target.files || []) as File[];
@@ -268,20 +291,30 @@ const App: React.FC = () => {
     setFiles(prev => [...prev, ...selectedFiles]);
     setError(null);
 
+    // Only process metadata for the first file if strict single file tools are used, 
+    // or loop for others.
     if (activeTool !== 'IMAGE_TO_PDF') {
+      const newPreviews: string[] = [];
       for (const file of selectedFiles) {
         try {
           const previewUrl = await generatePreview(file);
-          if (previewUrl) setPreviews(prev => [...prev, previewUrl]);
-          
-          if (['SPLIT_PDF', 'PDF_TO_IMAGE', 'OCR_PDF', 'COMPRESS_PDF'].includes(activeTool as string)) {
-            const arrayBuffer = await file.arrayBuffer();
-            const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-            setMaxPages(pdf.numPages);
-            setSplitRange({ start: 1, end: pdf.numPages });
-          }
+          if (previewUrl) newPreviews.push(previewUrl);
         } catch (err: any) {
-          setError(err?.message || "Error reading PDF file metadata.");
+          console.warn("Could not generate preview for " + file.name);
+        }
+      }
+      setPreviews(prev => [...prev, ...newPreviews]);
+
+      // Set max pages based on the *first* file added if the list was empty,
+      // or just assume we focus on the first file for Splitting/OCR.
+      if (files.length === 0 && selectedFiles.length > 0) {
+        try {
+          const arrayBuffer = await selectedFiles[0].arrayBuffer();
+          const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+          setMaxPages(pdf.numPages);
+          setSplitRange({ start: 1, end: pdf.numPages });
+        } catch (e) {
+          console.error("Error reading PDF metadata", e);
         }
       }
     }
@@ -295,7 +328,7 @@ const App: React.FC = () => {
       const arrayBuffer = await files[0].arrayBuffer();
       const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
       let textContent = '';
-      const pagesToScan = Math.min(pdf.numPages, 3);
+      const pagesToScan = Math.min(pdf.numPages, 4); // Increased scan limit slightly
       for (let i = 1; i <= pagesToScan; i++) {
         const page = await pdf.getPage(i);
         const text = await page.getTextContent();
@@ -327,7 +360,7 @@ const App: React.FC = () => {
     link.href = url;
     link.download = filename;
     link.click();
-    URL.revokeObjectURL(url);
+    setTimeout(() => URL.revokeObjectURL(url), 100);
   };
 
   const processOCR = async () => {
@@ -340,11 +373,12 @@ const App: React.FC = () => {
     try {
       const arrayBuffer = await files[0].arrayBuffer();
       const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-      const numPages = Math.min(pdf.numPages, 20);
+      const numPages = Math.min(pdf.numPages, 50); // Hard limit to prevent browser crash on huge docs
 
       for (let i = 1; i <= numPages; i++) {
         setStatusDetail(t.pageOf.replace('{current}', i.toString()).replace('{total}', numPages.toString()));
         const page = await pdf.getPage(i);
+        // Optimization: slightly lower scale if page count is high, but keeping 2.5 for quality
         const viewport = page.getViewport({ scale: 2.5 });
         const canvas = document.createElement('canvas');
         const context = canvas.getContext('2d');
@@ -352,15 +386,21 @@ const App: React.FC = () => {
         canvas.width = viewport.width;
         await page.render({ canvasContext: context, viewport }).promise;
         const imgData = canvas.toDataURL('image/png');
-        const result = await Tesseract.recognize(imgData, 'ben+eng', {
-          logger: m => {
-            if (m.status === 'recognizing text') {
-              const currentProgress = Math.round(((i - 1) / numPages) * 100 + (m.progress * (100 / numPages)));
-              setProgress(currentProgress);
+        
+        try {
+          const result = await Tesseract.recognize(imgData, 'ben+eng', {
+            logger: m => {
+              if (m.status === 'recognizing text') {
+                const currentProgress = Math.round(((i - 1) / numPages) * 100 + (m.progress * (100 / numPages)));
+                setProgress(currentProgress);
+              }
             }
-          }
-        });
-        fullExtractedText += `--- Page ${i} ---\n${result.data.text.trim()}\n\n`;
+          });
+          fullExtractedText += `--- Page ${i} ---\n${result.data.text.trim()}\n\n`;
+        } catch (tessErr) {
+          console.error(`OCR Error on page ${i}`, tessErr);
+          fullExtractedText += `--- Page ${i} (Error) ---\nFailed to read text.\n\n`;
+        }
       }
       setOcrText(fullExtractedText || t.noText);
       setStatus(ConversionStatus.COMPLETED);
@@ -386,9 +426,12 @@ const App: React.FC = () => {
       const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
       const total = pdf.numPages;
 
-      // Lower quality = lower DPI
-      const scale = 0.5 + (compressionLevel / 100); // 0.5 to 1.5
-      const quality = compressionLevel / 100;
+      // Logic refinement: 
+      // compressionLevel 10 (High compression, Low Quality) -> quality 0.1
+      // compressionLevel 90 (Low compression, High Quality) -> quality 0.9
+      const quality = Math.max(0.1, Math.min(0.9, compressionLevel / 100));
+      // Scale: Lower scale for higher compression to reduce pixel count
+      const scale = compressionLevel < 30 ? 1.0 : (1.0 + (compressionLevel / 200)); 
 
       for (let i = 1; i <= total; i++) {
         setStatusDetail(t.pageOf.replace('{current}', i.toString()).replace('{total}', total.toString()));
@@ -401,7 +444,10 @@ const App: React.FC = () => {
         await page.render({ canvasContext: context, viewport }).promise;
         
         const imgData = canvas.toDataURL('image/jpeg', quality);
-        const imageBytes = await fetch(imgData).then(res => res.arrayBuffer());
+        
+        // Optimization: Use Direct Uint8Array conversion instead of fetch
+        const imageBytes = dataURItoUint8Array(imgData);
+        
         const pdfImage = await outPdf.embedJpg(imageBytes);
         const newPage = outPdf.addPage([pdfImage.width, pdfImage.height]);
         newPage.drawImage(pdfImage, { x: 0, y: 0, width: pdfImage.width, height: pdfImage.height });
@@ -444,6 +490,9 @@ const App: React.FC = () => {
           const mimeType = `image/${imageConfig.format}`;
           const imgData = canvas.toDataURL(mimeType, imageConfig.quality);
           const ext = imageConfig.format === 'jpeg' ? 'jpg' : imageConfig.format;
+          
+          // JSZip handles base64 string stripping automatically if passed properly, 
+          // but explicit split is safer given the existing implementation style.
           zip.file(`${file.name.replace('.pdf', '')}_page-${i}.${ext}`, imgData.split(',')[1], { base64: true });
           setProgress(Math.round(((i / totalPages) * 100)));
         }
@@ -476,6 +525,7 @@ const App: React.FC = () => {
         const file = files[i];
         setStatusDetail(t.pageOf.replace('{current}', (i + 1).toString()).replace('{total}', files.length.toString()));
         
+        // Promise wrapper for cleaner async image loading
         const img = await new Promise<HTMLImageElement>((resolve, reject) => {
           const reader = new FileReader();
           reader.onload = () => {
@@ -495,7 +545,8 @@ const App: React.FC = () => {
         ctx?.drawImage(img, 0, 0);
         
         const compressedDataUrl = canvas.toDataURL('image/jpeg', quality);
-        const imageBytes = await fetch(compressedDataUrl).then(res => res.arrayBuffer());
+        // Optimization: Use Direct Uint8Array conversion
+        const imageBytes = dataURItoUint8Array(compressedDataUrl);
         
         const pdfImage = await pdfDoc.embedJpg(imageBytes);
         const page = pdfDoc.addPage([pdfImage.width, pdfImage.height]);
@@ -531,7 +582,7 @@ const App: React.FC = () => {
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
         const bytes = await file.arrayBuffer();
-        const pdf = await PDFDocument.load(bytes);
+        const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
         const copiedPages = await mergedPdf.copyPages(pdf, pdf.getPageIndices());
         copiedPages.forEach((page) => mergedPdf.addPage(page));
         setProgress(Math.round(((i + 1) / files.length) * 100));
@@ -555,20 +606,30 @@ const App: React.FC = () => {
     setStatusDetail(t.splitting);
     try {
       const bytes = await files[0].arrayBuffer();
-      const splitPdf = await PDFDocument.create();
-      const start = Math.max(1, splitRange.start);
-      const end = Math.min(maxPages, splitRange.end);
+      // Ensure we load the max pages again to be sure bounds are correct relative to the file
+      const sourcePdfDoc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+      const totalPages = sourcePdfDoc.getPageCount();
+      
+      let start = parseInt(splitRange.start as any) || 1;
+      let end = parseInt(splitRange.end as any) || totalPages;
+      
+      // Strict validation
+      start = Math.max(1, Math.min(start, totalPages));
+      end = Math.max(1, Math.min(end, totalPages));
       
       if (start > end) {
-        throw new Error("Start page cannot be greater than end page.");
+        // Swap if user messed up
+        [start, end] = [end, start];
       }
 
+      const splitPdf = await PDFDocument.create();
       const indices = Array.from({ length: end - start + 1 }, (_, i) => i + start - 1);
-      const sourcePdfDoc = await PDFDocument.load(bytes);
+      
       const copiedPages = await splitPdf.copyPages(sourcePdfDoc, indices);
       copiedPages.forEach(page => splitPdf.addPage(page));
+      
       const splitBytes = await splitPdf.save();
-      triggerDownload(new Blob([splitBytes]), `split_document.pdf`);
+      triggerDownload(new Blob([splitBytes]), `split_document_${start}-${end}.pdf`);
       setStatus(ConversionStatus.COMPLETED);
       setProgress(100);
       setStatusDetail('');
@@ -635,6 +696,7 @@ const App: React.FC = () => {
             <button 
               onClick={() => setLang(l => l === 'bn' ? 'en' : 'bn')}
               className="flex items-center gap-2 px-4 py-2 rounded-xl glass hover:bg-slate-100 dark:hover:bg-slate-700 transition-all font-bold text-sm text-slate-700 dark:text-slate-200"
+              aria-label="Switch Language"
             >
               <Languages className="w-4 h-4 text-indigo-500" />
               <span className="hidden sm:inline">{lang === 'bn' ? 'EN' : 'BN'}</span>
@@ -642,6 +704,7 @@ const App: React.FC = () => {
             <button 
               onClick={() => setDarkMode(!darkMode)}
               className="p-3 glass hover:bg-slate-100 dark:hover:bg-slate-700 rounded-xl shadow-sm transition-all text-slate-700 dark:text-slate-200"
+              aria-label="Toggle Dark Mode"
             >
               {darkMode ? <Sun className="w-5 h-5 text-yellow-500" /> : <Moon className="w-5 h-5 text-indigo-500" />}
             </button>
@@ -729,6 +792,7 @@ const App: React.FC = () => {
             <button 
               onClick={() => navigateTo('HOME')}
               className="group flex items-center gap-3 px-6 py-3 rounded-2xl glass hover:bg-white dark:hover:bg-slate-800 transition-all font-black text-slate-500 dark:text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 shadow-sm border border-transparent hover:border-indigo-100 dark:hover:border-indigo-900"
+              aria-label="Go Back"
             >
               <ArrowLeft className="w-5 h-5 group-hover:-translate-x-1 transition-transform" /> {t.back}
             </button>
@@ -786,7 +850,7 @@ const App: React.FC = () => {
                               <div className="font-black text-slate-800 dark:text-slate-100 truncate text-lg tracking-tight">{f.name}</div>
                               <div className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">{(f.size / (1024 * 1024)).toFixed(2)} MB • {t.preview}</div>
                             </div>
-                            <button onClick={() => removeFile(i)} className="p-4 text-slate-300 hover:text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20 rounded-2xl transition-all">
+                            <button onClick={() => removeFile(i)} className="p-4 text-slate-300 hover:text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20 rounded-2xl transition-all" aria-label="Remove File">
                               <Trash2 className="w-6 h-6" />
                             </button>
                           </div>
