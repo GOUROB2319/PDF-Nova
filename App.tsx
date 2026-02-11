@@ -190,6 +190,11 @@ const canvasToJpegBytes = async (canvas: HTMLCanvasElement, quality: number): Pr
   return new Uint8Array(buffer);
 };
 
+const sanitizeFilename = (name: string): string => {
+  const cleaned = name.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').trim();
+  return cleaned || 'download.bin';
+};
+
 const translations = {
   bn: {
     title: 'পিডিএফ নোভা',
@@ -354,9 +359,10 @@ const translations = {
 };
 
 const App: React.FC = () => {
-  const [lang, setLang] = useState<'bn' | 'en'>('bn');
+  const [lang, setLang] = useState<'bn' | 'en' | 'hi'>('bn');
   const [darkMode, setDarkMode] = useState(false);
-  const t = translations[lang];
+  const t = lang === 'hi' ? translations.en : translations[lang];
+  const [toolGridColumns, setToolGridColumns] = useState<3 | 6 | 9>(3);
 
   const [view, setView] = useState<ViewType>('HOME');
   const [activeTool, setActiveTool] = useState<ToolType | null>(null);
@@ -524,19 +530,19 @@ const App: React.FC = () => {
     if (activeTool === 'IMAGE_TO_PDF') {
       const nonImages = selectedFiles.filter(f => !f.type.startsWith('image/'));
       if (nonImages.length > 0) {
-        setError(lang === 'bn' ? '????????? ??? ??????? ?????' : 'Please select image files only.');
+        setError('Please select image files only.');
         return;
       }
     } else if (activeTool === 'SECURITY_PDF') {
       const invalidFiles = selectedFiles.filter((f) => !(f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pnova')));
       if (invalidFiles.length > 0) {
-        setError(lang === 'bn' ? '????????? PDF ?? .pnova ???? ??????? ?????' : 'Please select PDF or .pnova files only.');
+        setError('Please select PDF or .pnova files only.');
         return;
       }
     } else {
       const nonPdfs = selectedFiles.filter(f => f.type !== 'application/pdf');
       if (nonPdfs.length > 0) {
-        setError(lang === 'bn' ? '????????? ?????? ??????? ?????' : 'Please select PDF files only.');
+        setError('Please select PDF files only.');
         return;
       }
     }
@@ -625,7 +631,7 @@ const App: React.FC = () => {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = filename;
+    link.download = sanitizeFilename(filename);
     link.click();
     setTimeout(() => URL.revokeObjectURL(url), 100);
   };
@@ -968,6 +974,9 @@ const App: React.FC = () => {
       if (!password) {
         throw new Error(lang === 'bn' ? 'পাসওয়ার্ড দিন।' : 'Please provide a password.');
       }
+      if (password.length < 8) {
+        throw new Error(lang === 'bn' ? 'পাসওয়ার্ড কমপক্ষে ৮ অক্ষরের দিন।' : 'Use at least 8 characters for password.');
+      }
 
       if (securityMode === 'LOCK') {
         if (file.type !== 'application/pdf') {
@@ -1035,7 +1044,7 @@ const App: React.FC = () => {
   const processPageTools = async () => {
     if (files.length === 0) return;
     resetProcessingState();
-    setStatusDetail(lang === 'bn' ? '??? ???? ?????? ?????...' : 'Processing page tools...');
+    setStatusDetail('Processing page tools...');
 
     try {
       const bytes = await files[0].arrayBuffer();
@@ -1044,7 +1053,7 @@ const App: React.FC = () => {
       const selectedPages = parsePageSelection(pageSelection, totalPages);
 
       if (selectedPages.length === 0 && !['PAGE_NUMBERS', 'REORDER', 'METADATA'].includes(pageToolMode)) {
-        throw new Error(lang === 'bn' ? '???? ??? ???????? ???? (????: 1-3,5)' : 'Select valid pages (e.g. 1-3,5)');
+        throw new Error('Select valid pages (e.g. 1-3,5)');
       }
 
       if (pageToolMode === 'ROTATE') {
@@ -1128,7 +1137,7 @@ const App: React.FC = () => {
             : Array.from({ length: totalPages }, (_, i) => i).filter((idx) => !keepSet.has(idx));
 
         if (pageIndices.length === 0) {
-          throw new Error(lang === 'bn' ? '?? ??? ???? ???? ???? ???' : 'Cannot remove all pages.');
+          throw new Error('Cannot remove all pages.');
         }
 
         const copiedPages = await outputPdf.copyPages(sourcePdfDoc, pageIndices);
@@ -1150,7 +1159,7 @@ const App: React.FC = () => {
         setStatus(ConversionStatus.IDLE);
         setStatusDetail('');
       } else {
-        setError(err?.message || (lang === 'bn' ? '??? ???? ?????? ?????? ??????' : 'Page tools processing failed.'));
+        setError(err?.message || 'Page tools processing failed.');
         setStatus(ConversionStatus.ERROR);
       }
     }
@@ -1219,7 +1228,17 @@ const App: React.FC = () => {
   ];
 
   return (
-    <div className="min-h-screen flex flex-col relative">
+    <div
+      className="min-h-screen flex flex-col relative"
+      style={{
+        fontFamily:
+          lang === 'bn'
+            ? "'Hind Siliguri', sans-serif"
+            : lang === 'hi'
+              ? "'Noto Sans Devanagari', sans-serif"
+              : "'Inter', sans-serif",
+      }}
+    >
       <div className="absolute top-0 -left-4 w-72 h-72 bg-purple-300 dark:bg-indigo-900 rounded-full mix-blend-multiply filter blur-3xl opacity-30 animate-blob"></div>
       <div className="absolute top-0 -right-4 w-72 h-72 bg-yellow-300 dark:bg-purple-900 rounded-full mix-blend-multiply filter blur-3xl opacity-30 animate-blob animation-delay-2000"></div>
       <div className="absolute -bottom-8 left-20 w-72 h-72 bg-pink-300 dark:bg-blue-900 rounded-full mix-blend-multiply filter blur-3xl opacity-30 animate-blob animation-delay-4000"></div>
@@ -1243,12 +1262,14 @@ const App: React.FC = () => {
 
           <div className="flex items-center gap-4">
             <button 
-              onClick={() => setLang(l => l === 'bn' ? 'en' : 'bn')}
+              onClick={() => setLang(l => l === 'bn' ? 'en' : l === 'en' ? 'hi' : 'bn')}
               className="flex items-center gap-2 px-4 py-2 rounded-xl glass hover:bg-slate-100 dark:hover:bg-slate-700 transition-all font-bold text-sm text-slate-700 dark:text-slate-200"
               aria-label="Switch Language"
             >
               <Languages className="w-4 h-4 text-indigo-500" />
-              <span className="hidden sm:inline">{lang === 'bn' ? 'EN' : 'BN'}</span>
+              <span className="hidden sm:inline">
+                {lang === 'bn' ? 'EN' : lang === 'en' ? 'HI' : 'BN'}
+              </span>
             </button>
             <button 
               onClick={() => setDarkMode(!darkMode)}
@@ -1286,7 +1307,19 @@ const App: React.FC = () => {
               </div>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8">
+            <div className="hidden lg:flex items-center justify-end gap-3">
+              {[3, 6, 9].map((cols) => (
+                <button
+                  key={cols}
+                  onClick={() => setToolGridColumns(cols as 3 | 6 | 9)}
+                  className={`px-4 py-2 rounded-xl text-xs font-black tracking-widest border transition-all ${toolGridColumns === cols ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white/70 dark:bg-slate-800/70 text-slate-500 border-slate-200 dark:border-slate-700'}`}
+                >
+                  {cols}
+                </button>
+              ))}
+            </div>
+
+            <div className="tool-grid gap-8" style={{ ['--desktop-cols' as any]: toolGridColumns }}>
               {toolList.map((tool, idx) => (
                 <div 
                   key={tool.id}
