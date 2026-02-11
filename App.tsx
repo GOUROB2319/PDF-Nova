@@ -11,7 +11,7 @@ import {
   Maximize2, Minimize2
 } from 'lucide-react';
 import JSZip from 'jszip';
-import { PDFDocument } from 'pdf-lib';
+import { PDFDocument, StandardFonts, degrees, rgb } from 'pdf-lib';
 import Tesseract from 'tesseract.js';
 import { ConversionStatus, ToolType, ConversionConfig, PDFOutputConfig } from './types';
 import { getPDFSummary } from './services/geminiService';
@@ -19,6 +19,152 @@ import { getPDFSummary } from './services/geminiService';
 declare const pdfjsLib: any;
 
 type ViewType = 'HOME' | 'TOOL' | 'PRIVACY' | 'SAFETY' | 'OPENSOURCE';
+type PageToolMode = 'EXTRACT' | 'DELETE' | 'ROTATE' | 'WATERMARK' | 'PAGE_NUMBERS' | 'REORDER' | 'METADATA';
+type SplitMode = 'RANGE' | 'EVERY_N' | 'CUSTOM';
+type SecurityMode = 'LOCK' | 'UNLOCK';
+type PerformanceMode = 'BALANCED' | 'MEMORY';
+
+const MAX_TOTAL_FILE_BYTES = 1024 * 1024 * 1024; // 1GB
+const PBKDF2_ITERATIONS = 150000;
+
+const parsePageSelection = (input: string, totalPages: number): number[] => {
+  const cleaned = (input || '').replace(/\s+/g, '');
+  if (!cleaned) return [];
+
+  const pageSet = new Set<number>();
+  for (const token of cleaned.split(',')) {
+    if (!token) continue;
+
+    if (token.includes('-')) {
+      const [startRaw, endRaw] = token.split('-');
+      let start = parseInt(startRaw, 10);
+      let end = parseInt(endRaw, 10);
+      if (Number.isNaN(start) || Number.isNaN(end)) continue;
+      start = Math.max(1, Math.min(start, totalPages));
+      end = Math.max(1, Math.min(end, totalPages));
+      if (start > end) [start, end] = [end, start];
+      for (let i = start; i <= end; i++) {
+        pageSet.add(i);
+      }
+      continue;
+    }
+
+    const page = parseInt(token, 10);
+    if (!Number.isNaN(page) && page >= 1 && page <= totalPages) {
+      pageSet.add(page);
+    }
+  }
+
+  return Array.from(pageSet).sort((a, b) => a - b);
+};
+
+const parseRangeSegments = (input: string, totalPages: number): Array<{ start: number; end: number }> => {
+  const cleaned = (input || '').replace(/\s+/g, '');
+  if (!cleaned) return [];
+  const ranges: Array<{ start: number; end: number }> = [];
+
+  for (const token of cleaned.split(',')) {
+    if (!token) continue;
+    if (token.includes('-')) {
+      const [startRaw, endRaw] = token.split('-');
+      let start = parseInt(startRaw, 10);
+      let end = parseInt(endRaw, 10);
+      if (Number.isNaN(start) || Number.isNaN(end)) continue;
+      start = Math.max(1, Math.min(start, totalPages));
+      end = Math.max(1, Math.min(end, totalPages));
+      if (start > end) [start, end] = [end, start];
+      ranges.push({ start, end });
+    } else {
+      const page = parseInt(token, 10);
+      if (!Number.isNaN(page) && page >= 1 && page <= totalPages) {
+        ranges.push({ start: page, end: page });
+      }
+    }
+  }
+  return ranges;
+};
+
+const parsePageOrder = (input: string, totalPages: number): number[] => {
+  const ranges = parseRangeSegments(input, totalPages);
+  const seen = new Set<number>();
+  const order: number[] = [];
+
+  for (const range of ranges) {
+    for (let p = range.start; p <= range.end; p++) {
+      if (!seen.has(p)) {
+        seen.add(p);
+        order.push(p);
+      }
+    }
+  }
+
+  for (let p = 1; p <= totalPages; p++) {
+    if (!seen.has(p)) order.push(p);
+  }
+  return order;
+};
+
+const bytesToBase64 = (bytes: Uint8Array): string => {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+};
+
+const base64ToBytes = (value: string): Uint8Array => {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+};
+
+const deriveKey = async (password: string, salt: Uint8Array) => {
+  const encoder = new TextEncoder();
+  const baseKey = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt,
+      iterations: PBKDF2_ITERATIONS,
+      hash: 'SHA-256',
+    },
+    baseKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+};
+
+const encryptBytesWithPassword = async (bytes: Uint8Array, password: string): Promise<string> => {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveKey(password, salt);
+  const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, bytes);
+  return JSON.stringify({
+    v: 1,
+    alg: 'AES-GCM',
+    iter: PBKDF2_ITERATIONS,
+    salt: bytesToBase64(salt),
+    iv: bytesToBase64(iv),
+    data: bytesToBase64(new Uint8Array(encrypted)),
+  });
+};
+
+const decryptBytesWithPassword = async (payloadRaw: string, password: string): Promise<Uint8Array> => {
+  const payload = JSON.parse(payloadRaw);
+  if (!payload?.salt || !payload?.iv || !payload?.data) {
+    throw new Error('Invalid encrypted file format.');
+  }
+  const salt = base64ToBytes(payload.salt);
+  const iv = base64ToBytes(payload.iv);
+  const data = base64ToBytes(payload.data);
+  const key = await deriveKey(password, salt);
+  const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data);
+  return new Uint8Array(decrypted);
+};
 
 // Helper to convert Data URI to Uint8Array directly to avoid network stack overhead of fetch()
 const dataURItoUint8Array = (dataURI: string) => {
@@ -34,6 +180,19 @@ const dataURItoUint8Array = (dataURI: string) => {
     console.error("Error converting Data URI", e);
     return new Uint8Array(0);
   }
+};
+
+const canvasToJpegBytes = async (canvas: HTMLCanvasElement, quality: number): Promise<Uint8Array> => {
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Failed to create JPEG blob'))), 'image/jpeg', quality);
+  });
+  const buffer = await blob.arrayBuffer();
+  return new Uint8Array(buffer);
+};
+
+const sanitizeFilename = (name: string): string => {
+  const cleaned = name.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').trim();
+  return cleaned || 'download.bin';
 };
 
 const translations = {
@@ -200,9 +359,10 @@ const translations = {
 };
 
 const App: React.FC = () => {
-  const [lang, setLang] = useState<'bn' | 'en'>('bn');
+  const [lang, setLang] = useState<'bn' | 'en' | 'hi'>('bn');
   const [darkMode, setDarkMode] = useState(false);
-  const t = translations[lang];
+  const t = lang === 'hi' ? translations.en : translations[lang];
+  const [toolGridColumns, setToolGridColumns] = useState<3 | 6 | 9>(3);
 
   const [view, setView] = useState<ViewType>('HOME');
   const [activeTool, setActiveTool] = useState<ToolType | null>(null);
@@ -231,8 +391,30 @@ const App: React.FC = () => {
 
   const [compressionLevel, setCompressionLevel] = useState(50); // 1-100
 
+  const [splitMode, setSplitMode] = useState<SplitMode>('RANGE');
   const [splitRange, setSplitRange] = useState({ start: 1, end: 1 });
+  const [splitEveryN, setSplitEveryN] = useState(2);
+  const [splitCustomRanges, setSplitCustomRanges] = useState('1-2,3-4');
   const [maxPages, setMaxPages] = useState(1);
+  const [previewPage, setPreviewPage] = useState(1);
+  const [detailedPreview, setDetailedPreview] = useState<string | null>(null);
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false);
+
+  const [pageToolMode, setPageToolMode] = useState<PageToolMode>('EXTRACT');
+  const [pageSelection, setPageSelection] = useState('1');
+  const [rotateAngle, setRotateAngle] = useState<90 | 180 | 270>(90);
+  const [reorderInput, setReorderInput] = useState('1-9999');
+  const [watermarkText, setWatermarkText] = useState('CONFIDENTIAL');
+  const [watermarkOpacity, setWatermarkOpacity] = useState(0.25);
+  const [metadataTitle, setMetadataTitle] = useState('');
+  const [metadataAuthor, setMetadataAuthor] = useState('');
+  const [metadataSubject, setMetadataSubject] = useState('');
+  const [ocrLanguage, setOcrLanguage] = useState<'ben' | 'eng' | 'ben+eng'>('ben+eng');
+  const [cancelRequested, setCancelRequested] = useState(false);
+  const cancelRef = useRef(false);
+  const [performanceMode, setPerformanceMode] = useState<PerformanceMode>('BALANCED');
+  const [securityMode, setSecurityMode] = useState<SecurityMode>('UNLOCK');
+  const [securityPassword, setSecurityPassword] = useState('');
   
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -243,6 +425,66 @@ const App: React.FC = () => {
       document.documentElement.classList.remove('dark');
     }
   }, [darkMode]);
+
+  const resetProcessingState = () => {
+    cancelRef.current = false;
+    setCancelRequested(false);
+    setStatus(ConversionStatus.PROCESSING);
+    setProgress(0);
+    setError(null);
+  };
+
+  const ensureNotCancelled = () => {
+    if (cancelRef.current) {
+      throw new Error(lang === 'bn' ? 'প্রসেসিং বাতিল করা হয়েছে।' : 'Processing cancelled by user.');
+    }
+  };
+
+  const getTaskScale = (balancedValue: number, memoryValue: number) =>
+    performanceMode === 'MEMORY' ? memoryValue : balancedValue;
+
+  const yieldToUI = async () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  const renderDetailedPreview = useCallback(
+    async (file: File, pageNum: number) => {
+      if (!file || file.type !== 'application/pdf') {
+        setDetailedPreview(null);
+        return;
+      }
+      try {
+        setIsPreviewLoading(true);
+        const arrayBuffer = await file.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+        const safePage = Math.max(1, Math.min(pageNum, pdf.numPages));
+        const page = await pdf.getPage(safePage);
+        const viewport = page.getViewport({ scale: 0.9 });
+        const canvas = document.createElement('canvas');
+        const context = canvas.getContext('2d');
+        canvas.height = viewport.height;
+        canvas.width = viewport.width;
+        await page.render({ canvasContext: context, viewport }).promise;
+        setDetailedPreview(canvas.toDataURL('image/png'));
+      } catch (previewErr) {
+        console.error('Detailed preview failed', previewErr);
+        setDetailedPreview(null);
+      } finally {
+        setIsPreviewLoading(false);
+      }
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (files.length === 0 || files[0].type !== 'application/pdf') {
+      setDetailedPreview(null);
+      return;
+    }
+    renderDetailedPreview(files[0], previewPage);
+  }, [files, previewPage, renderDetailedPreview]);
+
+  useEffect(() => {
+    setPreviewPage((prev) => Math.min(Math.max(1, prev), Math.max(1, maxPages)));
+  }, [maxPages]);
 
   const generatePreview = useCallback(async (file: File) => {
     if (file.type !== 'application/pdf') return null;
@@ -274,20 +516,36 @@ const App: React.FC = () => {
     const selectedFiles = Array.from(e.target.files || []) as File[];
     if (selectedFiles.length === 0) return;
 
+    const currentTotal = files.reduce((sum, file) => sum + file.size, 0);
+    const incomingTotal = selectedFiles.reduce((sum, file) => sum + file.size, 0);
+    if (currentTotal + incomingTotal > MAX_TOTAL_FILE_BYTES) {
+      setError(
+        lang === 'bn'
+          ? 'মোট ফাইল সাইজ 1GB এর বেশি হওয়া যাবে না।'
+          : 'Total file size cannot exceed 1GB.'
+      );
+      return;
+    }
+
     if (activeTool === 'IMAGE_TO_PDF') {
       const nonImages = selectedFiles.filter(f => !f.type.startsWith('image/'));
       if (nonImages.length > 0) {
-        setError(lang === 'bn' ? 'শুধুমাত্র ছবি সিলেক্ট করুন।' : 'Please select image files only.');
+        setError('Please select image files only.');
+        return;
+      }
+    } else if (activeTool === 'SECURITY_PDF') {
+      const invalidFiles = selectedFiles.filter((f) => !(f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pnova')));
+      if (invalidFiles.length > 0) {
+        setError('Please select PDF or .pnova files only.');
         return;
       }
     } else {
       const nonPdfs = selectedFiles.filter(f => f.type !== 'application/pdf');
       if (nonPdfs.length > 0) {
-        setError(lang === 'bn' ? 'শুধুমাত্র পিডিএফ সিলেক্ট করুন।' : 'Please select PDF files only.');
+        setError('Please select PDF files only.');
         return;
       }
     }
-
     setFiles(prev => [...prev, ...selectedFiles]);
     setError(null);
 
@@ -307,12 +565,20 @@ const App: React.FC = () => {
 
       // Set max pages based on the *first* file added if the list was empty,
       // or just assume we focus on the first file for Splitting/OCR.
-      if (files.length === 0 && selectedFiles.length > 0) {
+      if (files.length === 0 && selectedFiles.length > 0 && selectedFiles[0].type === 'application/pdf') {
         try {
           const arrayBuffer = await selectedFiles[0].arrayBuffer();
           const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
           setMaxPages(pdf.numPages);
           setSplitRange({ start: 1, end: pdf.numPages });
+          setPageSelection(`1-${pdf.numPages}`);
+          setReorderInput(`1-${pdf.numPages}`);
+          setPreviewPage(1);
+
+          const loadedPdf = await PDFDocument.load(arrayBuffer, { ignoreEncryption: true });
+          setMetadataTitle(loadedPdf.getTitle() || '');
+          setMetadataAuthor(loadedPdf.getAuthor() || '');
+          setMetadataSubject(loadedPdf.getSubject() || '');
         } catch (e) {
           console.error("Error reading PDF metadata", e);
         }
@@ -351,6 +617,13 @@ const App: React.FC = () => {
       setAiSummary(null);
       setMaxPages(1);
       setSplitRange({ start: 1, end: 1 });
+      setPageSelection('1');
+      setReorderInput('1');
+      setPreviewPage(1);
+      setDetailedPreview(null);
+      setMetadataTitle('');
+      setMetadataAuthor('');
+      setMetadataSubject('');
     }
   };
 
@@ -358,28 +631,27 @@ const App: React.FC = () => {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = filename;
+    link.download = sanitizeFilename(filename);
     link.click();
     setTimeout(() => URL.revokeObjectURL(url), 100);
   };
 
   const processOCR = async () => {
     if (files.length === 0) return;
-    setStatus(ConversionStatus.PROCESSING);
-    setProgress(0);
-    setError(null);
+    resetProcessingState();
     let fullExtractedText = '';
 
     try {
       const arrayBuffer = await files[0].arrayBuffer();
       const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-      const numPages = Math.min(pdf.numPages, 50); // Hard limit to prevent browser crash on huge docs
+      const ocrCap = performanceMode === 'MEMORY' ? 35 : 60;
+      const numPages = Math.min(pdf.numPages, ocrCap);
 
       for (let i = 1; i <= numPages; i++) {
+        ensureNotCancelled();
         setStatusDetail(t.pageOf.replace('{current}', i.toString()).replace('{total}', numPages.toString()));
         const page = await pdf.getPage(i);
-        // Optimization: slightly lower scale if page count is high, but keeping 2.5 for quality
-        const viewport = page.getViewport({ scale: 2.5 });
+        const viewport = page.getViewport({ scale: getTaskScale(2.2, 1.4) });
         const canvas = document.createElement('canvas');
         const context = canvas.getContext('2d');
         canvas.height = viewport.height;
@@ -388,7 +660,7 @@ const App: React.FC = () => {
         const imgData = canvas.toDataURL('image/png');
         
         try {
-          const result = await Tesseract.recognize(imgData, 'ben+eng', {
+          const result = await Tesseract.recognize(imgData, ocrLanguage, {
             logger: m => {
               if (m.status === 'recognizing text') {
                 const currentProgress = Math.round(((i - 1) / numPages) * 100 + (m.progress * (100 / numPages)));
@@ -401,6 +673,7 @@ const App: React.FC = () => {
           console.error(`OCR Error on page ${i}`, tessErr);
           fullExtractedText += `--- Page ${i} (Error) ---\nFailed to read text.\n\n`;
         }
+        await yieldToUI();
       }
       setOcrText(fullExtractedText || t.noText);
       setStatus(ConversionStatus.COMPLETED);
@@ -408,16 +681,19 @@ const App: React.FC = () => {
       setStatusDetail('');
     } catch (err: any) {
       console.error(err);
-      setError(err?.message || "Unknown error during OCR processing.");
-      setStatus(ConversionStatus.ERROR);
+      if ((err?.message || '').includes('cancelled')) {
+        setStatus(ConversionStatus.IDLE);
+        setStatusDetail('');
+      } else {
+        setError(err?.message || "Unknown error during OCR processing.");
+        setStatus(ConversionStatus.ERROR);
+      }
     }
   };
 
   const processCompressPDF = async () => {
     if (files.length === 0) return;
-    setStatus(ConversionStatus.PROCESSING);
-    setProgress(0);
-    setError(null);
+    resetProcessingState();
     setStatusDetail(t.compressing);
 
     try {
@@ -430,10 +706,10 @@ const App: React.FC = () => {
       // compressionLevel 10 (High compression, Low Quality) -> quality 0.1
       // compressionLevel 90 (Low compression, High Quality) -> quality 0.9
       const quality = Math.max(0.1, Math.min(0.9, compressionLevel / 100));
-      // Scale: Lower scale for higher compression to reduce pixel count
-      const scale = compressionLevel < 30 ? 1.0 : (1.0 + (compressionLevel / 200)); 
+      const scale = compressionLevel < 30 ? getTaskScale(1.0, 0.8) : getTaskScale(1.2 + (compressionLevel / 250), 0.9 + (compressionLevel / 300));
 
       for (let i = 1; i <= total; i++) {
+        ensureNotCancelled();
         setStatusDetail(t.pageOf.replace('{current}', i.toString()).replace('{total}', total.toString()));
         const page = await pdf.getPage(i);
         const viewport = page.getViewport({ scale });
@@ -443,16 +719,14 @@ const App: React.FC = () => {
         canvas.width = viewport.width;
         await page.render({ canvasContext: context, viewport }).promise;
         
-        const imgData = canvas.toDataURL('image/jpeg', quality);
-        
-        // Optimization: Use Direct Uint8Array conversion instead of fetch
-        const imageBytes = dataURItoUint8Array(imgData);
+        const imageBytes = await canvasToJpegBytes(canvas, quality);
         
         const pdfImage = await outPdf.embedJpg(imageBytes);
         const newPage = outPdf.addPage([pdfImage.width, pdfImage.height]);
         newPage.drawImage(pdfImage, { x: 0, y: 0, width: pdfImage.width, height: pdfImage.height });
         
         setProgress(Math.round((i / total) * 100));
+        await yieldToUI();
       }
 
       const pdfBytes = await outPdf.save();
@@ -461,28 +735,33 @@ const App: React.FC = () => {
       setStatusDetail('');
     } catch (err: any) {
       console.error(err);
-      setError(err?.message || "Compression failed.");
-      setStatus(ConversionStatus.ERROR);
+      if ((err?.message || '').includes('cancelled')) {
+        setStatus(ConversionStatus.IDLE);
+        setStatusDetail('');
+      } else {
+        setError(err?.message || "Compression failed.");
+        setStatus(ConversionStatus.ERROR);
+      }
     }
   };
 
   const processPDFToImage = async () => {
     if (files.length === 0) return;
-    setStatus(ConversionStatus.PROCESSING);
-    setProgress(0);
-    setError(null);
+    resetProcessingState();
     const zip = new JSZip();
 
     try {
       for (const file of files) {
+        ensureNotCancelled();
         const arrayBuffer = await file.arrayBuffer();
         const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
         const totalPages = pdf.numPages;
         
         for (let i = 1; i <= totalPages; i++) {
+          ensureNotCancelled();
           setStatusDetail(t.pageOf.replace('{current}', i.toString()).replace('{total}', totalPages.toString()));
           const page = await pdf.getPage(i);
-          const viewport = page.getViewport({ scale: imageConfig.scale });
+          const viewport = page.getViewport({ scale: performanceMode === 'MEMORY' ? Math.min(imageConfig.scale, 1.5) : imageConfig.scale });
           const canvas = document.createElement('canvas');
           const context = canvas.getContext('2d');
           canvas.height = viewport.height; canvas.width = viewport.width;
@@ -495,6 +774,7 @@ const App: React.FC = () => {
           // but explicit split is safer given the existing implementation style.
           zip.file(`${file.name.replace('.pdf', '')}_page-${i}.${ext}`, imgData.split(',')[1], { base64: true });
           setProgress(Math.round(((i / totalPages) * 100)));
+          await yieldToUI();
         }
       }
       setStatusDetail(lang === 'bn' ? 'জিপ ফাইল তৈরি হচ্ছে...' : 'Creating zip file...');
@@ -504,16 +784,19 @@ const App: React.FC = () => {
       setStatusDetail('');
     } catch (err: any) { 
       console.error(err);
-      setError(err?.message || "Unknown error during PDF to Image conversion.");
-      setStatus(ConversionStatus.ERROR); 
+      if ((err?.message || '').includes('cancelled')) {
+        setStatus(ConversionStatus.IDLE);
+        setStatusDetail('');
+      } else {
+        setError(err?.message || "Unknown error during PDF to Image conversion.");
+        setStatus(ConversionStatus.ERROR);
+      }
     }
   };
 
   const processImageToPDF = async () => {
     if (files.length === 0) return;
-    setStatus(ConversionStatus.PROCESSING);
-    setProgress(0);
-    setError(null);
+    resetProcessingState();
     setStatusDetail(t.creatingPdf);
 
     try {
@@ -522,6 +805,7 @@ const App: React.FC = () => {
       const quality = qualityMap[pdfOutputConfig.quality];
 
       for (let i = 0; i < files.length; i++) {
+        ensureNotCancelled();
         const file = files[i];
         setStatusDetail(t.pageOf.replace('{current}', (i + 1).toString()).replace('{total}', files.length.toString()));
         
@@ -544,9 +828,7 @@ const App: React.FC = () => {
         canvas.height = img.height;
         ctx?.drawImage(img, 0, 0);
         
-        const compressedDataUrl = canvas.toDataURL('image/jpeg', quality);
-        // Optimization: Use Direct Uint8Array conversion
-        const imageBytes = dataURItoUint8Array(compressedDataUrl);
+        const imageBytes = await canvasToJpegBytes(canvas, quality);
         
         const pdfImage = await pdfDoc.embedJpg(imageBytes);
         const page = pdfDoc.addPage([pdfImage.width, pdfImage.height]);
@@ -558,6 +840,7 @@ const App: React.FC = () => {
         });
 
         setProgress(Math.round(((i + 1) / files.length) * 100));
+        await yieldToUI();
       }
 
       const pdfBytes = await pdfDoc.save();
@@ -566,26 +849,31 @@ const App: React.FC = () => {
       setStatusDetail('');
     } catch (err: any) { 
       console.error(err);
-      setError(err?.message || "Unknown error during Image to PDF conversion.");
-      setStatus(ConversionStatus.ERROR); 
+      if ((err?.message || '').includes('cancelled')) {
+        setStatus(ConversionStatus.IDLE);
+        setStatusDetail('');
+      } else {
+        setError(err?.message || "Unknown error during Image to PDF conversion.");
+        setStatus(ConversionStatus.ERROR);
+      }
     }
   };
 
   const processMergePDF = async () => {
     if (files.length < 2) return;
-    setStatus(ConversionStatus.PROCESSING);
-    setProgress(0);
-    setError(null);
+    resetProcessingState();
     setStatusDetail(t.merging);
     try {
       const mergedPdf = await PDFDocument.create();
       for (let i = 0; i < files.length; i++) {
+        ensureNotCancelled();
         const file = files[i];
         const bytes = await file.arrayBuffer();
         const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
         const copiedPages = await mergedPdf.copyPages(pdf, pdf.getPageIndices());
         copiedPages.forEach((page) => mergedPdf.addPage(page));
         setProgress(Math.round(((i + 1) / files.length) * 100));
+        await yieldToUI();
       }
       const mergedBytes = await mergedPdf.save();
       triggerDownload(new Blob([mergedBytes]), 'merged_document.pdf');
@@ -593,64 +881,320 @@ const App: React.FC = () => {
       setStatusDetail('');
     } catch (err: any) { 
       console.error(err);
-      setError(err?.message || "Unknown error during PDF merging. Ensure files are not corrupted or encrypted.");
-      setStatus(ConversionStatus.ERROR); 
+      if ((err?.message || '').includes('cancelled')) {
+        setStatus(ConversionStatus.IDLE);
+        setStatusDetail('');
+      } else {
+        setError(err?.message || "Unknown error during PDF merging. Ensure files are not corrupted or encrypted.");
+        setStatus(ConversionStatus.ERROR);
+      }
     }
   };
 
   const processSplitPDF = async () => {
     if (files.length === 0) return;
-    setStatus(ConversionStatus.PROCESSING);
-    setProgress(0);
-    setError(null);
+    resetProcessingState();
     setStatusDetail(t.splitting);
     try {
       const bytes = await files[0].arrayBuffer();
-      // Ensure we load the max pages again to be sure bounds are correct relative to the file
       const sourcePdfDoc = await PDFDocument.load(bytes, { ignoreEncryption: true });
       const totalPages = sourcePdfDoc.getPageCount();
-      
-      let start = parseInt(splitRange.start as any) || 1;
-      let end = parseInt(splitRange.end as any) || totalPages;
-      
-      // Strict validation
-      start = Math.max(1, Math.min(start, totalPages));
-      end = Math.max(1, Math.min(end, totalPages));
-      
-      if (start > end) {
-        // Swap if user messed up
-        [start, end] = [end, start];
+
+      if (splitMode === 'RANGE') {
+        let start = parseInt(splitRange.start as any, 10) || 1;
+        let end = parseInt(splitRange.end as any, 10) || totalPages;
+        start = Math.max(1, Math.min(start, totalPages));
+        end = Math.max(1, Math.min(end, totalPages));
+        if (start > end) [start, end] = [end, start];
+
+        const splitPdf = await PDFDocument.create();
+        const indices = Array.from({ length: end - start + 1 }, (_, i) => i + start - 1);
+        const copiedPages = await splitPdf.copyPages(sourcePdfDoc, indices);
+        copiedPages.forEach((page) => splitPdf.addPage(page));
+        const splitBytes = await splitPdf.save();
+        triggerDownload(new Blob([splitBytes]), `split_document_${start}-${end}.pdf`);
+      } else {
+        const zip = new JSZip();
+        const segments: Array<{ start: number; end: number }> = [];
+
+        if (splitMode === 'EVERY_N') {
+          const n = Math.max(1, Math.min(splitEveryN, totalPages));
+          for (let start = 1; start <= totalPages; start += n) {
+            segments.push({ start, end: Math.min(totalPages, start + n - 1) });
+          }
+        } else {
+          segments.push(...parseRangeSegments(splitCustomRanges, totalPages));
+        }
+
+        if (segments.length === 0) {
+          throw new Error(lang === 'bn' ? 'সঠিক split range দিন।' : 'Provide valid split ranges.');
+        }
+
+        for (let i = 0; i < segments.length; i++) {
+          ensureNotCancelled();
+          const seg = segments[i];
+          const outputPdf = await PDFDocument.create();
+          const indices = Array.from({ length: seg.end - seg.start + 1 }, (_, idx) => seg.start + idx - 1);
+          const copiedPages = await outputPdf.copyPages(sourcePdfDoc, indices);
+          copiedPages.forEach((page) => outputPdf.addPage(page));
+          const outBytes = await outputPdf.save();
+          zip.file(`split_${seg.start}-${seg.end}.pdf`, outBytes);
+          setProgress(Math.round(((i + 1) / segments.length) * 100));
+          await yieldToUI();
+        }
+
+        const content = await zip.generateAsync({ type: 'blob' });
+        triggerDownload(content, `split_bundle_${files[0].name.replace('.pdf', '')}.zip`);
       }
 
-      const splitPdf = await PDFDocument.create();
-      const indices = Array.from({ length: end - start + 1 }, (_, i) => i + start - 1);
-      
-      const copiedPages = await splitPdf.copyPages(sourcePdfDoc, indices);
-      copiedPages.forEach(page => splitPdf.addPage(page));
-      
-      const splitBytes = await splitPdf.save();
-      triggerDownload(new Blob([splitBytes]), `split_document_${start}-${end}.pdf`);
       setStatus(ConversionStatus.COMPLETED);
       setProgress(100);
       setStatusDetail('');
     } catch (err: any) { 
       console.error(err);
-      setError(err?.message || "Unknown error during PDF splitting.");
-      setStatus(ConversionStatus.ERROR); 
+      if ((err?.message || '').includes('cancelled')) {
+        setStatus(ConversionStatus.IDLE);
+        setStatusDetail('');
+      } else {
+        setError(err?.message || "Unknown error during PDF splitting.");
+        setStatus(ConversionStatus.ERROR);
+      }
     }
   };
 
+  const processSecurityPDF = async () => {
+    if (files.length === 0) return;
+    resetProcessingState();
+    setStatusDetail(lang === 'bn' ? 'সিকিউরিটি প্রসেস চলছে...' : 'Running security workflow...');
+
+    try {
+      const file = files[0];
+      const lowerName = file.name.toLowerCase();
+      const password = securityPassword.trim();
+      if (!password) {
+        throw new Error(lang === 'bn' ? 'পাসওয়ার্ড দিন।' : 'Please provide a password.');
+      }
+      if (password.length < 8) {
+        throw new Error(lang === 'bn' ? 'পাসওয়ার্ড কমপক্ষে ৮ অক্ষরের দিন।' : 'Use at least 8 characters for password.');
+      }
+
+      if (securityMode === 'LOCK') {
+        if (file.type !== 'application/pdf') {
+          throw new Error(lang === 'bn' ? 'Lock mode শুধু PDF এর জন্য।' : 'Lock mode supports PDF only.');
+        }
+        const raw = new Uint8Array(await file.arrayBuffer());
+        const payload = await encryptBytesWithPassword(raw, password);
+        const blob = new Blob([payload], { type: 'application/octet-stream' });
+        const safeName = file.name.replace(/\.pdf$/i, '');
+        triggerDownload(blob, `${safeName}.pnova`);
+        setProgress(100);
+      } else {
+        if (lowerName.endsWith('.pnova')) {
+          const rawPayload = await file.text();
+          const decrypted = await decryptBytesWithPassword(rawPayload, password);
+          triggerDownload(new Blob([decrypted], { type: 'application/pdf' }), `${file.name.replace(/\.pnova$/i, '')}_unlocked.pdf`);
+          setProgress(100);
+        } else {
+          if (file.type !== 'application/pdf') {
+            throw new Error(lang === 'bn' ? 'Unlock mode এ PDF বা .pnova দিন।' : 'Unlock mode accepts PDF or .pnova.');
+          }
+
+          const arrayBuffer = await file.arrayBuffer();
+          const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer, password });
+          const pdf = await loadingTask.promise;
+          const outPdf = await PDFDocument.create();
+
+          for (let i = 1; i <= pdf.numPages; i++) {
+            ensureNotCancelled();
+            setStatusDetail(`${lang === 'bn' ? 'পাসওয়ার্ড আনলক' : 'Password unlock'} ${i}/${pdf.numPages}`);
+            const page = await pdf.getPage(i);
+            const viewport = page.getViewport({ scale: getTaskScale(1.9, 1.2) });
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d');
+            canvas.width = viewport.width;
+            canvas.height = viewport.height;
+            await page.render({ canvasContext: context, viewport }).promise;
+            const jpgBytes = await canvasToJpegBytes(canvas, 0.9);
+            const image = await outPdf.embedJpg(jpgBytes);
+            const outPage = outPdf.addPage([image.width, image.height]);
+            outPage.drawImage(image, { x: 0, y: 0, width: image.width, height: image.height });
+            setProgress(Math.round((i / pdf.numPages) * 100));
+            await yieldToUI();
+          }
+
+          const unlockedBytes = await outPdf.save();
+          triggerDownload(new Blob([unlockedBytes], { type: 'application/pdf' }), `${file.name.replace(/\\.pdf$/i, '')}_unlocked.pdf`);
+        }
+      }
+
+      setStatus(ConversionStatus.COMPLETED);
+      setStatusDetail('');
+    } catch (err: any) {
+      console.error(err);
+      if ((err?.message || '').includes('cancelled')) {
+        setStatus(ConversionStatus.IDLE);
+        setStatusDetail('');
+      } else {
+        setError(err?.message || (lang === 'bn' ? 'সিকিউরিটি প্রসেস ব্যর্থ হয়েছে।' : 'Security workflow failed.'));
+        setStatus(ConversionStatus.ERROR);
+      }
+    }
+  };
+
+  const processPageTools = async () => {
+    if (files.length === 0) return;
+    resetProcessingState();
+    setStatusDetail('Processing page tools...');
+
+    try {
+      const bytes = await files[0].arrayBuffer();
+      const sourcePdfDoc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+      const totalPages = sourcePdfDoc.getPageCount();
+      const selectedPages = parsePageSelection(pageSelection, totalPages);
+
+      if (selectedPages.length === 0 && !['PAGE_NUMBERS', 'REORDER', 'METADATA'].includes(pageToolMode)) {
+        throw new Error('Select valid pages (e.g. 1-3,5)');
+      }
+
+      if (pageToolMode === 'ROTATE') {
+        const pages = sourcePdfDoc.getPages();
+        selectedPages.forEach((pageNum, idx) => {
+          ensureNotCancelled();
+          const page = pages[pageNum - 1];
+          page.setRotation(degrees(rotateAngle));
+          setProgress(Math.round(((idx + 1) / selectedPages.length) * 100));
+        });
+        const updated = await sourcePdfDoc.save();
+        triggerDownload(new Blob([updated], { type: 'application/pdf' }), `rotated_${files[0].name}`);
+      } else if (pageToolMode === 'WATERMARK') {
+        const font = await sourcePdfDoc.embedFont(StandardFonts.HelveticaBold);
+        const pages = sourcePdfDoc.getPages();
+        selectedPages.forEach((pageNum, idx) => {
+          ensureNotCancelled();
+          const page = pages[pageNum - 1];
+          const { width, height } = page.getSize();
+          const fontSize = Math.min(width, height) / 10;
+          page.drawText(watermarkText || 'CONFIDENTIAL', {
+            x: width * 0.15,
+            y: height * 0.5,
+            size: fontSize,
+            font,
+            rotate: degrees(-35),
+            color: rgb(0.85, 0.1, 0.1),
+            opacity: watermarkOpacity,
+          });
+          setProgress(Math.round(((idx + 1) / selectedPages.length) * 100));
+        });
+        const updated = await sourcePdfDoc.save();
+        triggerDownload(new Blob([updated], { type: 'application/pdf' }), `watermarked_${files[0].name}`);
+      } else if (pageToolMode === 'PAGE_NUMBERS') {
+        const font = await sourcePdfDoc.embedFont(StandardFonts.Helvetica);
+        const pages = sourcePdfDoc.getPages();
+        pages.forEach((page, idx) => {
+          ensureNotCancelled();
+          const label = `${idx + 1} / ${pages.length}`;
+          const size = 12;
+          const textWidth = font.widthOfTextAtSize(label, size);
+          page.drawText(label, {
+            x: (page.getWidth() - textWidth) / 2,
+            y: 18,
+            size,
+            font,
+            color: rgb(0.25, 0.25, 0.25),
+            opacity: 0.85,
+          });
+          setProgress(Math.round(((idx + 1) / pages.length) * 100));
+        });
+        const updated = await sourcePdfDoc.save();
+        triggerDownload(new Blob([updated], { type: 'application/pdf' }), `numbered_${files[0].name}`);
+      } else if (pageToolMode === 'REORDER') {
+        const order = parsePageOrder(reorderInput, totalPages);
+        const outputPdf = await PDFDocument.create();
+        const indices = order.map((page) => page - 1);
+        const copiedPages = await outputPdf.copyPages(sourcePdfDoc, indices);
+        copiedPages.forEach((page, idx) => {
+          ensureNotCancelled();
+          outputPdf.addPage(page);
+          setProgress(Math.round(((idx + 1) / copiedPages.length) * 100));
+        });
+        const updated = await outputPdf.save();
+        triggerDownload(new Blob([updated], { type: 'application/pdf' }), `reordered_${files[0].name}`);
+      } else if (pageToolMode === 'METADATA') {
+        sourcePdfDoc.setTitle(metadataTitle || '');
+        sourcePdfDoc.setAuthor(metadataAuthor || '');
+        sourcePdfDoc.setSubject(metadataSubject || '');
+        sourcePdfDoc.setProducer('PDF Nova');
+        sourcePdfDoc.setCreator('PDF Nova');
+        const updated = await sourcePdfDoc.save();
+        setProgress(100);
+        triggerDownload(new Blob([updated], { type: 'application/pdf' }), `metadata_updated_${files[0].name}`);
+      } else {
+        const outputPdf = await PDFDocument.create();
+        const keepSet = new Set(selectedPages.map((p) => p - 1));
+        const pageIndices =
+          pageToolMode === 'EXTRACT'
+            ? Array.from(keepSet).sort((a, b) => a - b)
+            : Array.from({ length: totalPages }, (_, i) => i).filter((idx) => !keepSet.has(idx));
+
+        if (pageIndices.length === 0) {
+          throw new Error('Cannot remove all pages.');
+        }
+
+        const copiedPages = await outputPdf.copyPages(sourcePdfDoc, pageIndices);
+        copiedPages.forEach((page, idx) => {
+          ensureNotCancelled();
+          outputPdf.addPage(page);
+          setProgress(Math.round(((idx + 1) / copiedPages.length) * 100));
+        });
+        const updated = await outputPdf.save();
+        const prefix = pageToolMode === 'EXTRACT' ? 'extracted' : 'deleted';
+        triggerDownload(new Blob([updated], { type: 'application/pdf' }), `${prefix}_${files[0].name}`);
+      }
+
+      setStatus(ConversionStatus.COMPLETED);
+      setStatusDetail('');
+    } catch (err: any) {
+      console.error(err);
+      if ((err?.message || '').includes('cancelled')) {
+        setStatus(ConversionStatus.IDLE);
+        setStatusDetail('');
+      } else {
+        setError(err?.message || 'Page tools processing failed.');
+        setStatus(ConversionStatus.ERROR);
+      }
+    }
+  };
   const resetTool = () => {
     setFiles([]);
     setPreviews([]);
+    setDetailedPreview(null);
+    setPreviewPage(1);
     setAiSummary(null);
     setStatus(ConversionStatus.IDLE);
     setProgress(0);
     setStatusDetail('');
     setError(null);
     setOcrText(null);
+    setCancelRequested(false);
+    cancelRef.current = false;
+    setSplitMode('RANGE');
     setMaxPages(1);
     setSplitRange({ start: 1, end: 1 });
+    setSplitEveryN(2);
+    setSplitCustomRanges('1-2,3-4');
+    setPageToolMode('EXTRACT');
+    setPageSelection('1');
+    setRotateAngle(90);
+    setReorderInput('1');
+    setWatermarkText('CONFIDENTIAL');
+    setWatermarkOpacity(0.25);
+    setMetadataTitle('');
+    setMetadataAuthor('');
+    setMetadataSubject('');
+    setOcrLanguage('ben+eng');
+    setSecurityMode('UNLOCK');
+    setSecurityPassword('');
+    setPerformanceMode('BALANCED');
   };
 
   const navigateTo = (newView: ViewType, tool: ToolType | null = null) => {
@@ -665,12 +1209,36 @@ const App: React.FC = () => {
     { id: 'IMAGE_TO_PDF', title: t.imgToPdf, desc: t.imgToPdfDesc, icon: FilePlus, gradient: 'from-emerald-500 via-teal-600 to-cyan-700' },
     { id: 'MERGE_PDF', title: t.merge, desc: t.mergeDesc, icon: Combine, gradient: 'from-indigo-600 via-purple-600 to-pink-600' },
     { id: 'SPLIT_PDF', title: t.split, desc: t.splitDesc, icon: Scissors, gradient: 'from-rose-500 via-pink-600 to-orange-600' },
+    {
+      id: 'PAGE_TOOLS',
+      title: lang === 'bn' ? 'পেজ টুলস' : 'Page Tools',
+      desc: lang === 'bn' ? 'Rotate, Delete, Extract, Watermark, Numbering, Reorder, Metadata' : 'Rotate, Delete, Extract, Watermark, Numbering, Reorder, Metadata',
+      icon: Layers,
+      gradient: 'from-cyan-500 via-blue-600 to-indigo-700'
+    },
+    {
+      id: 'SECURITY_PDF',
+      title: lang === 'bn' ? 'PDF সিকিউরিটি' : 'PDF Security',
+      desc: lang === 'bn' ? 'Client-side lock/unlock (fallback supported)' : 'Client-side lock/unlock (fallback supported)',
+      icon: Lock,
+      gradient: 'from-emerald-600 via-teal-600 to-cyan-700'
+    },
     { id: 'OCR_PDF', title: t.ocr, desc: t.ocrDesc, icon: Search, gradient: 'from-purple-500 via-violet-600 to-indigo-700' },
     { id: 'COMPRESS_PDF', title: t.compress, desc: t.compressDesc, icon: Zap, gradient: 'from-orange-500 via-amber-600 to-yellow-600' }
   ];
 
   return (
-    <div className="min-h-screen flex flex-col relative">
+    <div
+      className="min-h-screen flex flex-col relative"
+      style={{
+        fontFamily:
+          lang === 'bn'
+            ? "'Hind Siliguri', sans-serif"
+            : lang === 'hi'
+              ? "'Noto Sans Devanagari', sans-serif"
+              : "'Inter', sans-serif",
+      }}
+    >
       <div className="absolute top-0 -left-4 w-72 h-72 bg-purple-300 dark:bg-indigo-900 rounded-full mix-blend-multiply filter blur-3xl opacity-30 animate-blob"></div>
       <div className="absolute top-0 -right-4 w-72 h-72 bg-yellow-300 dark:bg-purple-900 rounded-full mix-blend-multiply filter blur-3xl opacity-30 animate-blob animation-delay-2000"></div>
       <div className="absolute -bottom-8 left-20 w-72 h-72 bg-pink-300 dark:bg-blue-900 rounded-full mix-blend-multiply filter blur-3xl opacity-30 animate-blob animation-delay-4000"></div>
@@ -694,12 +1262,14 @@ const App: React.FC = () => {
 
           <div className="flex items-center gap-4">
             <button 
-              onClick={() => setLang(l => l === 'bn' ? 'en' : 'bn')}
+              onClick={() => setLang(l => l === 'bn' ? 'en' : l === 'en' ? 'hi' : 'bn')}
               className="flex items-center gap-2 px-4 py-2 rounded-xl glass hover:bg-slate-100 dark:hover:bg-slate-700 transition-all font-bold text-sm text-slate-700 dark:text-slate-200"
               aria-label="Switch Language"
             >
               <Languages className="w-4 h-4 text-indigo-500" />
-              <span className="hidden sm:inline">{lang === 'bn' ? 'EN' : 'BN'}</span>
+              <span className="hidden sm:inline">
+                {lang === 'bn' ? 'EN' : lang === 'en' ? 'HI' : 'BN'}
+              </span>
             </button>
             <button 
               onClick={() => setDarkMode(!darkMode)}
@@ -737,7 +1307,19 @@ const App: React.FC = () => {
               </div>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8">
+            <div className="hidden lg:flex items-center justify-end gap-3">
+              {[3, 6, 9].map((cols) => (
+                <button
+                  key={cols}
+                  onClick={() => setToolGridColumns(cols as 3 | 6 | 9)}
+                  className={`px-4 py-2 rounded-xl text-xs font-black tracking-widest border transition-all ${toolGridColumns === cols ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white/70 dark:bg-slate-800/70 text-slate-500 border-slate-200 dark:border-slate-700'}`}
+                >
+                  {cols}
+                </button>
+              ))}
+            </div>
+
+            <div className="tool-grid gap-8" style={{ ['--desktop-cols' as any]: toolGridColumns }}>
               {toolList.map((tool, idx) => (
                 <div 
                   key={tool.id}
@@ -823,7 +1405,7 @@ const App: React.FC = () => {
                         ref={fileInputRef} 
                         onChange={handleFileChange} 
                         multiple={activeTool === 'MERGE_PDF' || activeTool === 'IMAGE_TO_PDF'}
-                        accept={activeTool === 'IMAGE_TO_PDF' ? "image/*" : "application/pdf"} 
+                        accept={activeTool === 'IMAGE_TO_PDF' ? "image/*" : activeTool === 'SECURITY_PDF' ? '.pdf,.pnova,application/pdf' : "application/pdf"} 
                         className="hidden" 
                       />
                       <div className="relative z-10">
@@ -832,6 +1414,7 @@ const App: React.FC = () => {
                         </div>
                         <h4 className="text-3xl font-black mb-3 text-slate-800 dark:text-white tracking-tight">{t.upload}</h4>
                         <p className="text-slate-400 dark:text-slate-500 font-bold tracking-wide">{t.dragDrop}</p>
+                        <p className="mt-3 text-[11px] font-bold text-slate-400 dark:text-slate-500">Max total size: 1GB</p>
                       </div>
                     </div>
                   ) : (
@@ -892,6 +1475,42 @@ const App: React.FC = () => {
                   )}
                 </div>
 
+                {files.length > 0 && files[0].type === 'application/pdf' && (
+                  <div className="bg-white/80 dark:bg-slate-800/80 glass rounded-[3rem] p-8 md:p-10 shadow-2xl">
+                    <div className="flex items-center justify-between gap-4 mb-6">
+                      <h4 className="text-2xl font-black text-slate-900 dark:text-white tracking-tight">
+                        {lang === 'bn' ? 'ডিটেইলড প্রিভিউ' : 'Detailed Preview'}
+                      </h4>
+                      <div className="flex items-center gap-3">
+                        <button
+                          onClick={() => setPreviewPage((p) => Math.max(1, p - 1))}
+                          className="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 font-black text-xs"
+                        >
+                          {lang === 'bn' ? 'Prev' : 'Prev'}
+                        </button>
+                        <span className="text-xs font-black text-slate-500 dark:text-slate-400 min-w-[80px] text-center">
+                          {previewPage} / {maxPages}
+                        </span>
+                        <button
+                          onClick={() => setPreviewPage((p) => Math.min(maxPages, p + 1))}
+                          className="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 font-black text-xs"
+                        >
+                          {lang === 'bn' ? 'Next' : 'Next'}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="rounded-2xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/50 p-3 min-h-[260px] flex items-center justify-center">
+                      {isPreviewLoading ? (
+                        <Loader2 className="w-8 h-8 animate-spin text-indigo-500" />
+                      ) : detailedPreview ? (
+                        <img src={detailedPreview} alt="Detailed PDF Preview" className="w-full h-auto rounded-xl object-contain max-h-[480px]" />
+                      ) : (
+                        <span className="text-sm font-bold text-slate-400">{lang === 'bn' ? 'প্রিভিউ পাওয়া যায়নি' : 'Preview unavailable'}</span>
+                      )}
+                    </div>
+                  </div>
+                )}
+
                 {activeTool === 'OCR_PDF' && ocrText && (
                   <div className="space-y-8 animate-in slide-in-from-bottom-10 duration-700">
                     <div className="p-6 bg-amber-50 dark:bg-amber-900/20 border-l-4 border-amber-400 rounded-xl flex items-center gap-4">
@@ -918,6 +1537,20 @@ const App: React.FC = () => {
                           >
                             <Download className="w-5 h-5" />
                             {t.downloadWord}
+                          </button>
+                          <button 
+                            onClick={() => triggerDownload(new Blob([ocrText || ''], { type: 'text/plain;charset=utf-8' }), 'extracted_text.txt')}
+                            className="flex items-center gap-3 px-6 py-4 rounded-2xl font-black text-sm transition-all shadow-xl hover:-translate-y-1 bg-gradient-to-r from-slate-700 to-slate-900 text-white"
+                          >
+                            <Download className="w-5 h-5" />
+                            TXT
+                          </button>
+                          <button 
+                            onClick={() => triggerDownload(new Blob([`# OCR Output\n\n${ocrText || ''}`], { type: 'text/markdown;charset=utf-8' }), 'extracted_text.md')}
+                            className="flex items-center gap-3 px-6 py-4 rounded-2xl font-black text-sm transition-all shadow-xl hover:-translate-y-1 bg-gradient-to-r from-emerald-600 to-teal-700 text-white"
+                          >
+                            <Download className="w-5 h-5" />
+                            MD
                           </button>
                           <button 
                             onClick={() => {
@@ -954,6 +1587,26 @@ const App: React.FC = () => {
                       <h4 className="text-2xl font-black dark:text-white tracking-tight">{t.settings}</h4>
                     </div>
                     <div className="space-y-10">
+                      <div className="space-y-5">
+                        <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">
+                          {lang === 'bn' ? 'পারফরম্যান্স মোড' : 'Performance Mode'}
+                        </label>
+                        <div className="grid grid-cols-2 gap-3 p-2 bg-slate-100/50 dark:bg-slate-900/50 rounded-2xl shadow-inner">
+                          {[
+                            { id: 'BALANCED', labelBn: 'Balanced', labelEn: 'Balanced' },
+                            { id: 'MEMORY', labelBn: 'Memory', labelEn: 'Memory Saver' },
+                          ].map((mode) => (
+                            <button
+                              key={mode.id}
+                              onClick={() => setPerformanceMode(mode.id as PerformanceMode)}
+                              className={`py-3 text-[11px] font-black uppercase rounded-xl transition-all ${performanceMode === mode.id ? 'bg-white dark:bg-slate-700 shadow-md text-indigo-600 dark:text-indigo-300' : 'text-slate-400 hover:text-slate-600'}`}
+                            >
+                              {lang === 'bn' ? mode.labelBn : mode.labelEn}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
                       {activeTool === 'PDF_TO_IMAGE' && (
                         <>
                           <div className="space-y-5">
@@ -1042,31 +1695,274 @@ const App: React.FC = () => {
 
                       {activeTool === 'SPLIT_PDF' && (
                         <div className="space-y-8">
-                          <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">{t.splitRange}</label>
-                          <div className="flex gap-4">
-                            <div className="flex-1 space-y-3">
-                              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{t.from}</span>
-                              <input 
-                                type="number" min="1" max={maxPages}
-                                value={splitRange.start}
-                                onChange={(e) => setSplitRange(prev => ({...prev, start: parseInt(e.target.value) || 1}))}
-                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-indigo-500 rounded-2xl p-5 font-black text-xl text-indigo-600 dark:text-indigo-400 shadow-inner transition-all outline-none"
-                              />
-                            </div>
-                            <div className="flex-1 space-y-3">
-                              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{t.to}</span>
-                              <input 
-                                type="number" min="1" max={maxPages}
-                                value={splitRange.end}
-                                onChange={(e) => setSplitRange(prev => ({...prev, end: parseInt(e.target.value) || 1}))}
-                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-indigo-500 rounded-2xl p-5 font-black text-xl text-indigo-600 dark:text-indigo-400 shadow-inner transition-all outline-none"
-                              />
-                            </div>
+                          <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">
+                            {lang === 'bn' ? 'স্প্লিট মোড' : 'Split Mode'}
+                          </label>
+                          <div className="grid grid-cols-3 gap-3 p-2 bg-slate-100/50 dark:bg-slate-900/50 rounded-2xl shadow-inner">
+                            {[
+                              { id: 'RANGE', labelBn: 'Range', labelEn: 'Range' },
+                              { id: 'EVERY_N', labelBn: 'Every N', labelEn: 'Every N' },
+                              { id: 'CUSTOM', labelBn: 'Custom', labelEn: 'Custom' }
+                            ].map((mode) => (
+                              <button
+                                key={mode.id}
+                                onClick={() => setSplitMode(mode.id as SplitMode)}
+                                className={`py-3 text-[11px] font-black uppercase rounded-xl transition-all ${splitMode === mode.id ? 'bg-white dark:bg-slate-700 shadow-md text-indigo-600 dark:text-indigo-300' : 'text-slate-400 hover:text-slate-600'}`}
+                              >
+                                {lang === 'bn' ? mode.labelBn : mode.labelEn}
+                              </button>
+                            ))}
                           </div>
+
+                          {splitMode === 'RANGE' && (
+                            <div className="flex gap-4">
+                              <div className="flex-1 space-y-3">
+                                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{t.from}</span>
+                                <input 
+                                  type="number" min="1" max={maxPages}
+                                  value={splitRange.start}
+                                  onChange={(e) => setSplitRange(prev => ({...prev, start: parseInt(e.target.value) || 1}))}
+                                  className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-indigo-500 rounded-2xl p-5 font-black text-xl text-indigo-600 dark:text-indigo-400 shadow-inner transition-all outline-none"
+                                />
+                              </div>
+                              <div className="flex-1 space-y-3">
+                                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{t.to}</span>
+                                <input 
+                                  type="number" min="1" max={maxPages}
+                                  value={splitRange.end}
+                                  onChange={(e) => setSplitRange(prev => ({...prev, end: parseInt(e.target.value) || 1}))}
+                                  className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-indigo-500 rounded-2xl p-5 font-black text-xl text-indigo-600 dark:text-indigo-400 shadow-inner transition-all outline-none"
+                                />
+                              </div>
+                            </div>
+                          )}
+
+                          {splitMode === 'EVERY_N' && (
+                            <div className="space-y-3">
+                              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                                {lang === 'bn' ? 'প্রতি ফাইলে পেজ সংখ্যা' : 'Pages Per Split'}
+                              </span>
+                              <input
+                                type="number"
+                                min="1"
+                                max={Math.max(1, maxPages)}
+                                value={splitEveryN}
+                                onChange={(e) => setSplitEveryN(parseInt(e.target.value, 10) || 1)}
+                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-indigo-500 rounded-2xl p-4 font-black text-xl text-indigo-600 dark:text-indigo-400 shadow-inner transition-all outline-none"
+                              />
+                            </div>
+                          )}
+
+                          {splitMode === 'CUSTOM' && (
+                            <div className="space-y-3">
+                              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                                {lang === 'bn' ? 'কাস্টম রেঞ্জ (যেমন: 1-2,5-7)' : 'Custom Ranges (e.g. 1-2,5-7)'}
+                              </span>
+                              <input
+                                type="text"
+                                value={splitCustomRanges}
+                                onChange={(e) => setSplitCustomRanges(e.target.value)}
+                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-indigo-500 rounded-2xl p-4 font-bold text-sm text-indigo-700 dark:text-indigo-300 shadow-inner transition-all outline-none"
+                              />
+                            </div>
+                          )}
+
                           <div className="p-4 rounded-2xl bg-indigo-50 dark:bg-indigo-900/20 flex justify-between items-center">
                             <span className="text-xs font-bold text-indigo-600 dark:text-indigo-400 uppercase tracking-widest">{t.totalPages}</span>
                             <span className="text-2xl font-black text-indigo-700 dark:text-indigo-300">{maxPages}</span>
                           </div>
+                        </div>
+                      )}
+
+                      {activeTool === 'OCR_PDF' && (
+                        <div className="space-y-6">
+                          <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">
+                            {lang === 'bn' ? 'OCR ভাষা' : 'OCR Language'}
+                          </label>
+                          <div className="grid grid-cols-3 gap-3 p-2 bg-slate-100/50 dark:bg-slate-900/50 rounded-2xl shadow-inner">
+                            {[
+                              { id: 'ben', label: 'বাংলা' },
+                              { id: 'eng', label: 'English' },
+                              { id: 'ben+eng', label: 'বাংলা+EN' },
+                            ].map((opt) => (
+                              <button
+                                key={opt.id}
+                                onClick={() => setOcrLanguage(opt.id as 'ben' | 'eng' | 'ben+eng')}
+                                className={`py-3 text-[11px] font-black uppercase rounded-xl transition-all ${ocrLanguage === opt.id ? 'bg-white dark:bg-slate-700 shadow-md text-violet-600 dark:text-violet-300' : 'text-slate-400 hover:text-slate-600'}`}
+                              >
+                                {opt.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {activeTool === 'SECURITY_PDF' && (
+                        <div className="space-y-6">
+                          <div className="grid grid-cols-2 gap-3 p-2 bg-slate-100/50 dark:bg-slate-900/50 rounded-2xl shadow-inner">
+                            {[
+                              { id: 'UNLOCK', labelBn: 'Unlock', labelEn: 'Unlock' },
+                              { id: 'LOCK', labelBn: 'Lock', labelEn: 'Lock' },
+                            ].map((mode) => (
+                              <button
+                                key={mode.id}
+                                onClick={() => setSecurityMode(mode.id as SecurityMode)}
+                                className={`py-3 text-[11px] font-black uppercase rounded-xl transition-all ${securityMode === mode.id ? 'bg-white dark:bg-slate-700 shadow-md text-emerald-600 dark:text-emerald-300' : 'text-slate-400 hover:text-slate-600'}`}
+                              >
+                                {lang === 'bn' ? mode.labelBn : mode.labelEn}
+                              </button>
+                            ))}
+                          </div>
+
+                          <div className="space-y-3">
+                            <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">
+                              {lang === 'bn' ? 'পাসওয়ার্ড' : 'Password'}
+                            </label>
+                            <input
+                              type="password"
+                              value={securityPassword}
+                              onChange={(e) => setSecurityPassword(e.target.value)}
+                              placeholder={lang === 'bn' ? 'পাসওয়ার্ড লিখুন' : 'Enter password'}
+                              className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-emerald-500 rounded-2xl p-4 font-bold text-sm text-emerald-700 dark:text-emerald-300 shadow-inner transition-all outline-none"
+                            />
+                          </div>
+
+                          <p className="text-xs font-bold text-slate-400 leading-relaxed">
+                            {lang === 'bn'
+                              ? 'Lock mode PDF কে .pnova এনক্রিপ্টেড ফরম্যাটে রাখে। Unlock mode .pnova ডিক্রিপ্ট করে PDF বানায়; password PDF unlock এ fallback image-based rebuild ব্যবহার হয়।'
+                              : 'Lock mode stores PDF as encrypted .pnova. Unlock mode decrypts .pnova back to PDF; password-PDF unlock uses an image-based fallback rebuild.'}
+                          </p>
+                        </div>
+                      )}
+
+                      {activeTool === 'PAGE_TOOLS' && (
+                        <div className="space-y-8">
+                          <div className="space-y-5">
+                            <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">
+                              {lang === 'bn' ? 'টুল নির্বাচন' : 'Action'}
+                            </label>
+                            <div className="grid grid-cols-2 gap-3 p-2 bg-slate-100/50 dark:bg-slate-900/50 rounded-2xl shadow-inner">
+                              {[
+                                { id: 'EXTRACT', labelBn: 'Extract', labelEn: 'Extract' },
+                                { id: 'DELETE', labelBn: 'Delete', labelEn: 'Delete' },
+                                { id: 'ROTATE', labelBn: 'Rotate', labelEn: 'Rotate' },
+                                { id: 'WATERMARK', labelBn: 'Watermark', labelEn: 'Watermark' },
+                                { id: 'PAGE_NUMBERS', labelBn: 'Page No.', labelEn: 'Page No.' },
+                                { id: 'REORDER', labelBn: 'Reorder', labelEn: 'Reorder' },
+                                { id: 'METADATA', labelBn: 'Metadata', labelEn: 'Metadata' },
+                              ].map((mode) => (
+                                <button
+                                  key={mode.id}
+                                  onClick={() => setPageToolMode(mode.id as PageToolMode)}
+                                  className={`py-3 text-[11px] font-black uppercase rounded-xl transition-all ${pageToolMode === mode.id ? 'bg-white dark:bg-slate-700 shadow-md text-cyan-600 dark:text-cyan-300' : 'text-slate-400 hover:text-slate-600'}`}
+                                >
+                                  {lang === 'bn' ? mode.labelBn : mode.labelEn}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+
+                          {!['PAGE_NUMBERS', 'REORDER', 'METADATA'].includes(pageToolMode) && (
+                            <div className="space-y-3">
+                              <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">
+                                {lang === 'bn' ? 'পেজ সিলেকশন (যেমন 1-3,5)' : 'Page Selection (e.g. 1-3,5)'}
+                              </label>
+                              <input
+                                type="text"
+                                value={pageSelection}
+                                onChange={(e) => setPageSelection(e.target.value)}
+                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-cyan-500 rounded-2xl p-4 font-bold text-sm text-cyan-700 dark:text-cyan-300 shadow-inner transition-all outline-none"
+                              />
+                            </div>
+                          )}
+
+                          {pageToolMode === 'REORDER' && (
+                            <div className="space-y-3">
+                              <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">
+                                {lang === 'bn' ? 'নতুন অর্ডার (যেমন: 3,1,2 বা 2-5,1)' : 'Custom order (e.g. 3,1,2 or 2-5,1)'}
+                              </label>
+                              <input
+                                type="text"
+                                value={reorderInput}
+                                onChange={(e) => setReorderInput(e.target.value)}
+                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-cyan-500 rounded-2xl p-4 font-bold text-sm text-cyan-700 dark:text-cyan-300 shadow-inner transition-all outline-none"
+                              />
+                            </div>
+                          )}
+
+                          {pageToolMode === 'ROTATE' && (
+                            <div className="space-y-5">
+                              <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">
+                                {lang === 'bn' ? 'রোটেশন এঙ্গেল' : 'Rotation'}
+                              </label>
+                              <div className="grid grid-cols-3 gap-3 p-2 bg-slate-100/50 dark:bg-slate-900/50 rounded-2xl shadow-inner">
+                                {[90, 180, 270].map((angle) => (
+                                  <button
+                                    key={angle}
+                                    onClick={() => setRotateAngle(angle as 90 | 180 | 270)}
+                                    className={`py-3 text-xs font-black uppercase rounded-xl transition-all ${rotateAngle === angle ? 'bg-white dark:bg-slate-700 shadow-md text-cyan-600 dark:text-cyan-300' : 'text-slate-400 hover:text-slate-600'}`}
+                                  >
+                                    {angle}°
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {pageToolMode === 'WATERMARK' && (
+                            <div className="space-y-5">
+                              <input
+                                type="text"
+                                value={watermarkText}
+                                onChange={(e) => setWatermarkText(e.target.value)}
+                                placeholder={lang === 'bn' ? 'Watermark টেক্সট' : 'Watermark text'}
+                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-cyan-500 rounded-2xl p-4 font-bold text-sm text-cyan-700 dark:text-cyan-300 shadow-inner transition-all outline-none"
+                              />
+                              <div className="space-y-3">
+                                <div className="flex justify-between items-center">
+                                  <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em]">
+                                    {lang === 'bn' ? 'Opacity' : 'Opacity'}
+                                  </label>
+                                  <span className="text-cyan-600 dark:text-cyan-400 font-black text-sm">{Math.round(watermarkOpacity * 100)}%</span>
+                                </div>
+                                <input
+                                  type="range"
+                                  min="0.1"
+                                  max="0.6"
+                                  step="0.05"
+                                  value={watermarkOpacity}
+                                  onChange={(e) => setWatermarkOpacity(parseFloat(e.target.value))}
+                                  className="w-full h-3 bg-slate-100 dark:bg-slate-900 rounded-full appearance-none cursor-pointer accent-cyan-500 dark:accent-cyan-400"
+                                />
+                              </div>
+                            </div>
+                          )}
+
+                          {pageToolMode === 'METADATA' && (
+                            <div className="space-y-4">
+                              <input
+                                type="text"
+                                value={metadataTitle}
+                                onChange={(e) => setMetadataTitle(e.target.value)}
+                                placeholder={lang === 'bn' ? 'Title' : 'Title'}
+                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-cyan-500 rounded-2xl p-4 font-bold text-sm text-cyan-700 dark:text-cyan-300 shadow-inner transition-all outline-none"
+                              />
+                              <input
+                                type="text"
+                                value={metadataAuthor}
+                                onChange={(e) => setMetadataAuthor(e.target.value)}
+                                placeholder={lang === 'bn' ? 'Author' : 'Author'}
+                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-cyan-500 rounded-2xl p-4 font-bold text-sm text-cyan-700 dark:text-cyan-300 shadow-inner transition-all outline-none"
+                              />
+                              <input
+                                type="text"
+                                value={metadataSubject}
+                                onChange={(e) => setMetadataSubject(e.target.value)}
+                                placeholder={lang === 'bn' ? 'Subject' : 'Subject'}
+                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-cyan-500 rounded-2xl p-4 font-bold text-sm text-cyan-700 dark:text-cyan-300 shadow-inner transition-all outline-none"
+                              />
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
@@ -1084,6 +1980,16 @@ const App: React.FC = () => {
                          <div className="h-5 bg-white/10 rounded-full overflow-hidden p-1 shadow-inner">
                             <div className="h-full bg-gradient-to-r from-indigo-500 via-pink-500 to-indigo-500 rounded-full transition-all duration-500 animate-pulse" style={{ width: `${progress}%` }} />
                          </div>
+                         <button
+                           onClick={() => {
+                             cancelRef.current = true;
+                             setCancelRequested(true);
+                           }}
+                           disabled={cancelRequested}
+                           className={`w-full py-4 rounded-2xl font-black text-sm transition-all ${cancelRequested ? 'bg-slate-700 text-slate-300' : 'bg-rose-600 hover:bg-rose-700 text-white'}`}
+                         >
+                           {cancelRequested ? (lang === 'bn' ? 'বাতিলের অপেক্ষায়...' : 'Cancelling...') : (lang === 'bn' ? 'প্রসেস বাতিল করুন' : 'Cancel Processing')}
+                         </button>
                       </div>
                     ) : status === ConversionStatus.COMPLETED ? (
                       <div className="bg-emerald-50 dark:bg-emerald-900/10 border-2 border-emerald-100 dark:border-emerald-800/20 rounded-[3rem] p-12 text-center animate-in zoom-in-95 duration-500 space-y-8 shadow-2xl shadow-emerald-100 dark:shadow-none">
@@ -1104,6 +2010,8 @@ const App: React.FC = () => {
                           else if (activeTool === 'IMAGE_TO_PDF') processImageToPDF();
                           else if (activeTool === 'MERGE_PDF') processMergePDF();
                           else if (activeTool === 'SPLIT_PDF') processSplitPDF();
+                          else if (activeTool === 'PAGE_TOOLS') processPageTools();
+                          else if (activeTool === 'SECURITY_PDF') processSecurityPDF();
                           else if (activeTool === 'COMPRESS_PDF') processCompressPDF();
                         }}
                         className={`w-full bg-gradient-to-r ${toolList.find(t => t.id === activeTool)?.gradient} text-white py-8 rounded-[3rem] font-black text-2xl shadow-2xl transition-all hover:-translate-y-2 active:scale-95 flex items-center justify-center gap-5 group/btn`}

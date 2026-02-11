@@ -7,7 +7,15 @@ export enum ConversionStatus {
   ERROR = 'ERROR'
 }
 
-export type ToolType = 'PDF_TO_IMAGE' | 'IMAGE_TO_PDF' | 'MERGE_PDF' | 'SPLIT_PDF' | 'COMPRESS_PDF' | 'OCR_PDF';
+export type ToolType =
+  | 'PDF_TO_IMAGE'
+  | 'IMAGE_TO_PDF'
+  | 'MERGE_PDF'
+  | 'SPLIT_PDF'
+  | 'COMPRESS_PDF'
+  | 'OCR_PDF'
+  | 'PAGE_TOOLS'
+  | 'SECURITY_PDF';
 
 export interface FileMetadata {
   name: string;
