@@ -11,7 +11,7 @@ import {
   Maximize2, Minimize2
 } from 'lucide-react';
 import JSZip from 'jszip';
-import { PDFDocument } from 'pdf-lib';
+import { PDFDocument, StandardFonts, degrees, rgb } from 'pdf-lib';
 import Tesseract from 'tesseract.js';
 import { ConversionStatus, ToolType, ConversionConfig, PDFOutputConfig } from './types';
 import { getPDFSummary } from './services/geminiService';
@@ -19,6 +19,40 @@ import { getPDFSummary } from './services/geminiService';
 declare const pdfjsLib: any;
 
 type ViewType = 'HOME' | 'TOOL' | 'PRIVACY' | 'SAFETY' | 'OPENSOURCE';
+type PageToolMode = 'EXTRACT' | 'DELETE' | 'ROTATE' | 'WATERMARK' | 'PAGE_NUMBERS';
+
+const MAX_TOTAL_FILE_BYTES = 1024 * 1024 * 1024; // 1GB
+
+const parsePageSelection = (input: string, totalPages: number): number[] => {
+  const cleaned = (input || '').replace(/\s+/g, '');
+  if (!cleaned) return [];
+
+  const pageSet = new Set<number>();
+  for (const token of cleaned.split(',')) {
+    if (!token) continue;
+
+    if (token.includes('-')) {
+      const [startRaw, endRaw] = token.split('-');
+      let start = parseInt(startRaw, 10);
+      let end = parseInt(endRaw, 10);
+      if (Number.isNaN(start) || Number.isNaN(end)) continue;
+      start = Math.max(1, Math.min(start, totalPages));
+      end = Math.max(1, Math.min(end, totalPages));
+      if (start > end) [start, end] = [end, start];
+      for (let i = start; i <= end; i++) {
+        pageSet.add(i);
+      }
+      continue;
+    }
+
+    const page = parseInt(token, 10);
+    if (!Number.isNaN(page) && page >= 1 && page <= totalPages) {
+      pageSet.add(page);
+    }
+  }
+
+  return Array.from(pageSet).sort((a, b) => a - b);
+};
 
 // Helper to convert Data URI to Uint8Array directly to avoid network stack overhead of fetch()
 const dataURItoUint8Array = (dataURI: string) => {
@@ -233,6 +267,11 @@ const App: React.FC = () => {
 
   const [splitRange, setSplitRange] = useState({ start: 1, end: 1 });
   const [maxPages, setMaxPages] = useState(1);
+  const [pageToolMode, setPageToolMode] = useState<PageToolMode>('EXTRACT');
+  const [pageSelection, setPageSelection] = useState('1');
+  const [rotateAngle, setRotateAngle] = useState<90 | 180 | 270>(90);
+  const [watermarkText, setWatermarkText] = useState('CONFIDENTIAL');
+  const [watermarkOpacity, setWatermarkOpacity] = useState(0.25);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -274,6 +313,17 @@ const App: React.FC = () => {
     const selectedFiles = Array.from(e.target.files || []) as File[];
     if (selectedFiles.length === 0) return;
 
+    const currentTotal = files.reduce((sum, file) => sum + file.size, 0);
+    const incomingTotal = selectedFiles.reduce((sum, file) => sum + file.size, 0);
+    if (currentTotal + incomingTotal > MAX_TOTAL_FILE_BYTES) {
+      setError(
+        lang === 'bn'
+          ? 'মোট ফাইল সাইজ 1GB এর বেশি হওয়া যাবে না।'
+          : 'Total file size cannot exceed 1GB.'
+      );
+      return;
+    }
+
     if (activeTool === 'IMAGE_TO_PDF') {
       const nonImages = selectedFiles.filter(f => !f.type.startsWith('image/'));
       if (nonImages.length > 0) {
@@ -313,6 +363,7 @@ const App: React.FC = () => {
           const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
           setMaxPages(pdf.numPages);
           setSplitRange({ start: 1, end: pdf.numPages });
+          setPageSelection(`1-${pdf.numPages}`);
         } catch (e) {
           console.error("Error reading PDF metadata", e);
         }
@@ -351,6 +402,7 @@ const App: React.FC = () => {
       setAiSummary(null);
       setMaxPages(1);
       setSplitRange({ start: 1, end: 1 });
+      setPageSelection('1');
     }
   };
 
@@ -640,6 +692,102 @@ const App: React.FC = () => {
     }
   };
 
+  const processPageTools = async () => {
+    if (files.length === 0) return;
+    setStatus(ConversionStatus.PROCESSING);
+    setProgress(0);
+    setError(null);
+    setStatusDetail(lang === 'bn' ? 'পেজ টুলস প্রসেস হচ্ছে...' : 'Processing page tools...');
+
+    try {
+      const bytes = await files[0].arrayBuffer();
+      const sourcePdfDoc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+      const totalPages = sourcePdfDoc.getPageCount();
+      const selectedPages = parsePageSelection(pageSelection, totalPages);
+
+      if (selectedPages.length === 0 && pageToolMode !== 'PAGE_NUMBERS') {
+        throw new Error(lang === 'bn' ? 'সঠিক পেজ নির্বাচন করুন (যেমন: 1-3,5)' : 'Select valid pages (e.g. 1-3,5)');
+      }
+
+      if (pageToolMode === 'ROTATE') {
+        const pages = sourcePdfDoc.getPages();
+        selectedPages.forEach((pageNum, idx) => {
+          const page = pages[pageNum - 1];
+          page.setRotation(degrees(rotateAngle));
+          setProgress(Math.round(((idx + 1) / selectedPages.length) * 100));
+        });
+        const updated = await sourcePdfDoc.save();
+        triggerDownload(new Blob([updated], { type: 'application/pdf' }), `rotated_${files[0].name}`);
+      } else if (pageToolMode === 'WATERMARK') {
+        const font = await sourcePdfDoc.embedFont(StandardFonts.HelveticaBold);
+        const pages = sourcePdfDoc.getPages();
+        selectedPages.forEach((pageNum, idx) => {
+          const page = pages[pageNum - 1];
+          const { width, height } = page.getSize();
+          const fontSize = Math.min(width, height) / 10;
+          page.drawText(watermarkText || 'CONFIDENTIAL', {
+            x: width * 0.15,
+            y: height * 0.5,
+            size: fontSize,
+            font,
+            rotate: degrees(-35),
+            color: rgb(0.85, 0.1, 0.1),
+            opacity: watermarkOpacity,
+          });
+          setProgress(Math.round(((idx + 1) / selectedPages.length) * 100));
+        });
+        const updated = await sourcePdfDoc.save();
+        triggerDownload(new Blob([updated], { type: 'application/pdf' }), `watermarked_${files[0].name}`);
+      } else if (pageToolMode === 'PAGE_NUMBERS') {
+        const font = await sourcePdfDoc.embedFont(StandardFonts.Helvetica);
+        const pages = sourcePdfDoc.getPages();
+        pages.forEach((page, idx) => {
+          const label = `${idx + 1} / ${pages.length}`;
+          const size = 12;
+          const textWidth = font.widthOfTextAtSize(label, size);
+          page.drawText(label, {
+            x: (page.getWidth() - textWidth) / 2,
+            y: 18,
+            size,
+            font,
+            color: rgb(0.25, 0.25, 0.25),
+            opacity: 0.85,
+          });
+          setProgress(Math.round(((idx + 1) / pages.length) * 100));
+        });
+        const updated = await sourcePdfDoc.save();
+        triggerDownload(new Blob([updated], { type: 'application/pdf' }), `numbered_${files[0].name}`);
+      } else {
+        const outputPdf = await PDFDocument.create();
+        const keepSet = new Set(selectedPages.map((p) => p - 1));
+        const pageIndices =
+          pageToolMode === 'EXTRACT'
+            ? Array.from(keepSet).sort((a, b) => a - b)
+            : Array.from({ length: totalPages }, (_, i) => i).filter((idx) => !keepSet.has(idx));
+
+        if (pageIndices.length === 0) {
+          throw new Error(lang === 'bn' ? 'সব পেজ মুছে ফেলা যাবে না।' : 'Cannot remove all pages.');
+        }
+
+        const copiedPages = await outputPdf.copyPages(sourcePdfDoc, pageIndices);
+        copiedPages.forEach((page, idx) => {
+          outputPdf.addPage(page);
+          setProgress(Math.round(((idx + 1) / copiedPages.length) * 100));
+        });
+        const updated = await outputPdf.save();
+        const prefix = pageToolMode === 'EXTRACT' ? 'extracted' : 'deleted';
+        triggerDownload(new Blob([updated], { type: 'application/pdf' }), `${prefix}_${files[0].name}`);
+      }
+
+      setStatus(ConversionStatus.COMPLETED);
+      setStatusDetail('');
+    } catch (err: any) {
+      console.error(err);
+      setError(err?.message || (lang === 'bn' ? 'পেজ টুলস প্রসেস ব্যর্থ হয়েছে।' : 'Page tools processing failed.'));
+      setStatus(ConversionStatus.ERROR);
+    }
+  };
+
   const resetTool = () => {
     setFiles([]);
     setPreviews([]);
@@ -651,6 +799,11 @@ const App: React.FC = () => {
     setOcrText(null);
     setMaxPages(1);
     setSplitRange({ start: 1, end: 1 });
+    setPageToolMode('EXTRACT');
+    setPageSelection('1');
+    setRotateAngle(90);
+    setWatermarkText('CONFIDENTIAL');
+    setWatermarkOpacity(0.25);
   };
 
   const navigateTo = (newView: ViewType, tool: ToolType | null = null) => {
@@ -665,6 +818,13 @@ const App: React.FC = () => {
     { id: 'IMAGE_TO_PDF', title: t.imgToPdf, desc: t.imgToPdfDesc, icon: FilePlus, gradient: 'from-emerald-500 via-teal-600 to-cyan-700' },
     { id: 'MERGE_PDF', title: t.merge, desc: t.mergeDesc, icon: Combine, gradient: 'from-indigo-600 via-purple-600 to-pink-600' },
     { id: 'SPLIT_PDF', title: t.split, desc: t.splitDesc, icon: Scissors, gradient: 'from-rose-500 via-pink-600 to-orange-600' },
+    {
+      id: 'PAGE_TOOLS',
+      title: lang === 'bn' ? 'পেজ টুলস' : 'Page Tools',
+      desc: lang === 'bn' ? 'Rotate, Delete, Extract, Watermark, Numbering' : 'Rotate, Delete, Extract, Watermark, Numbering',
+      icon: Layers,
+      gradient: 'from-cyan-500 via-blue-600 to-indigo-700'
+    },
     { id: 'OCR_PDF', title: t.ocr, desc: t.ocrDesc, icon: Search, gradient: 'from-purple-500 via-violet-600 to-indigo-700' },
     { id: 'COMPRESS_PDF', title: t.compress, desc: t.compressDesc, icon: Zap, gradient: 'from-orange-500 via-amber-600 to-yellow-600' }
   ];
@@ -832,6 +992,7 @@ const App: React.FC = () => {
                         </div>
                         <h4 className="text-3xl font-black mb-3 text-slate-800 dark:text-white tracking-tight">{t.upload}</h4>
                         <p className="text-slate-400 dark:text-slate-500 font-bold tracking-wide">{t.dragDrop}</p>
+                        <p className="mt-3 text-[11px] font-bold text-slate-400 dark:text-slate-500">Max total size: 1GB</p>
                       </div>
                     </div>
                   ) : (
@@ -1069,6 +1230,95 @@ const App: React.FC = () => {
                           </div>
                         </div>
                       )}
+
+                      {activeTool === 'PAGE_TOOLS' && (
+                        <div className="space-y-8">
+                          <div className="space-y-5">
+                            <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">
+                              {lang === 'bn' ? 'টুল নির্বাচন' : 'Action'}
+                            </label>
+                            <div className="grid grid-cols-2 gap-3 p-2 bg-slate-100/50 dark:bg-slate-900/50 rounded-2xl shadow-inner">
+                              {[
+                                { id: 'EXTRACT', labelBn: 'Extract', labelEn: 'Extract' },
+                                { id: 'DELETE', labelBn: 'Delete', labelEn: 'Delete' },
+                                { id: 'ROTATE', labelBn: 'Rotate', labelEn: 'Rotate' },
+                                { id: 'WATERMARK', labelBn: 'Watermark', labelEn: 'Watermark' },
+                                { id: 'PAGE_NUMBERS', labelBn: 'Page No.', labelEn: 'Page No.' },
+                              ].map((mode) => (
+                                <button
+                                  key={mode.id}
+                                  onClick={() => setPageToolMode(mode.id as PageToolMode)}
+                                  className={`py-3 text-[11px] font-black uppercase rounded-xl transition-all ${pageToolMode === mode.id ? 'bg-white dark:bg-slate-700 shadow-md text-cyan-600 dark:text-cyan-300' : 'text-slate-400 hover:text-slate-600'}`}
+                                >
+                                  {lang === 'bn' ? mode.labelBn : mode.labelEn}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+
+                          {pageToolMode !== 'PAGE_NUMBERS' && (
+                            <div className="space-y-3">
+                              <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">
+                                {lang === 'bn' ? 'পেজ সিলেকশন (যেমন 1-3,5)' : 'Page Selection (e.g. 1-3,5)'}
+                              </label>
+                              <input
+                                type="text"
+                                value={pageSelection}
+                                onChange={(e) => setPageSelection(e.target.value)}
+                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-cyan-500 rounded-2xl p-4 font-bold text-sm text-cyan-700 dark:text-cyan-300 shadow-inner transition-all outline-none"
+                              />
+                            </div>
+                          )}
+
+                          {pageToolMode === 'ROTATE' && (
+                            <div className="space-y-5">
+                              <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">
+                                {lang === 'bn' ? 'রোটেশন এঙ্গেল' : 'Rotation'}
+                              </label>
+                              <div className="grid grid-cols-3 gap-3 p-2 bg-slate-100/50 dark:bg-slate-900/50 rounded-2xl shadow-inner">
+                                {[90, 180, 270].map((angle) => (
+                                  <button
+                                    key={angle}
+                                    onClick={() => setRotateAngle(angle as 90 | 180 | 270)}
+                                    className={`py-3 text-xs font-black uppercase rounded-xl transition-all ${rotateAngle === angle ? 'bg-white dark:bg-slate-700 shadow-md text-cyan-600 dark:text-cyan-300' : 'text-slate-400 hover:text-slate-600'}`}
+                                  >
+                                    {angle}°
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {pageToolMode === 'WATERMARK' && (
+                            <div className="space-y-5">
+                              <input
+                                type="text"
+                                value={watermarkText}
+                                onChange={(e) => setWatermarkText(e.target.value)}
+                                placeholder={lang === 'bn' ? 'Watermark টেক্সট' : 'Watermark text'}
+                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-cyan-500 rounded-2xl p-4 font-bold text-sm text-cyan-700 dark:text-cyan-300 shadow-inner transition-all outline-none"
+                              />
+                              <div className="space-y-3">
+                                <div className="flex justify-between items-center">
+                                  <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em]">
+                                    {lang === 'bn' ? 'Opacity' : 'Opacity'}
+                                  </label>
+                                  <span className="text-cyan-600 dark:text-cyan-400 font-black text-sm">{Math.round(watermarkOpacity * 100)}%</span>
+                                </div>
+                                <input
+                                  type="range"
+                                  min="0.1"
+                                  max="0.6"
+                                  step="0.05"
+                                  value={watermarkOpacity}
+                                  onChange={(e) => setWatermarkOpacity(parseFloat(e.target.value))}
+                                  className="w-full h-3 bg-slate-100 dark:bg-slate-900 rounded-full appearance-none cursor-pointer accent-cyan-500 dark:accent-cyan-400"
+                                />
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
                   <div className="space-y-6">
@@ -1104,6 +1354,7 @@ const App: React.FC = () => {
                           else if (activeTool === 'IMAGE_TO_PDF') processImageToPDF();
                           else if (activeTool === 'MERGE_PDF') processMergePDF();
                           else if (activeTool === 'SPLIT_PDF') processSplitPDF();
+                          else if (activeTool === 'PAGE_TOOLS') processPageTools();
                           else if (activeTool === 'COMPRESS_PDF') processCompressPDF();
                         }}
                         className={`w-full bg-gradient-to-r ${toolList.find(t => t.id === activeTool)?.gradient} text-white py-8 rounded-[3rem] font-black text-2xl shadow-2xl transition-all hover:-translate-y-2 active:scale-95 flex items-center justify-center gap-5 group/btn`}

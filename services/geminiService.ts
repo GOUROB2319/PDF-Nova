@@ -3,7 +3,10 @@ import { GoogleGenAI } from "@google/genai";
 
 export const getPDFSummary = async (text: string): Promise<string> => {
   try {
-    const apiKey = process.env.API_KEY;
+    const apiKey =
+      (import.meta as any)?.env?.VITE_GEMINI_API_KEY ||
+      (globalThis as any)?.process?.env?.GEMINI_API_KEY ||
+      (globalThis as any)?.process?.env?.API_KEY;
     if (!apiKey) {
       console.warn("API Key is missing. AI summary feature will not work.");
       return "এআই প্রসেসিংয়ের জন্য এপিআই কি (API Key) প্রয়োজন।";
