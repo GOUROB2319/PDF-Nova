@@ -19,7 +19,8 @@ import { getPDFSummary } from './services/geminiService';
 declare const pdfjsLib: any;
 
 type ViewType = 'HOME' | 'TOOL' | 'PRIVACY' | 'SAFETY' | 'OPENSOURCE';
-type PageToolMode = 'EXTRACT' | 'DELETE' | 'ROTATE' | 'WATERMARK' | 'PAGE_NUMBERS';
+type PageToolMode = 'EXTRACT' | 'DELETE' | 'ROTATE' | 'WATERMARK' | 'PAGE_NUMBERS' | 'REORDER' | 'METADATA';
+type SplitMode = 'RANGE' | 'EVERY_N' | 'CUSTOM';
 
 const MAX_TOTAL_FILE_BYTES = 1024 * 1024 * 1024; // 1GB
 
@@ -52,6 +53,52 @@ const parsePageSelection = (input: string, totalPages: number): number[] => {
   }
 
   return Array.from(pageSet).sort((a, b) => a - b);
+};
+
+const parseRangeSegments = (input: string, totalPages: number): Array<{ start: number; end: number }> => {
+  const cleaned = (input || '').replace(/\s+/g, '');
+  if (!cleaned) return [];
+  const ranges: Array<{ start: number; end: number }> = [];
+
+  for (const token of cleaned.split(',')) {
+    if (!token) continue;
+    if (token.includes('-')) {
+      const [startRaw, endRaw] = token.split('-');
+      let start = parseInt(startRaw, 10);
+      let end = parseInt(endRaw, 10);
+      if (Number.isNaN(start) || Number.isNaN(end)) continue;
+      start = Math.max(1, Math.min(start, totalPages));
+      end = Math.max(1, Math.min(end, totalPages));
+      if (start > end) [start, end] = [end, start];
+      ranges.push({ start, end });
+    } else {
+      const page = parseInt(token, 10);
+      if (!Number.isNaN(page) && page >= 1 && page <= totalPages) {
+        ranges.push({ start: page, end: page });
+      }
+    }
+  }
+  return ranges;
+};
+
+const parsePageOrder = (input: string, totalPages: number): number[] => {
+  const ranges = parseRangeSegments(input, totalPages);
+  const seen = new Set<number>();
+  const order: number[] = [];
+
+  for (const range of ranges) {
+    for (let p = range.start; p <= range.end; p++) {
+      if (!seen.has(p)) {
+        seen.add(p);
+        order.push(p);
+      }
+    }
+  }
+
+  for (let p = 1; p <= totalPages; p++) {
+    if (!seen.has(p)) order.push(p);
+  }
+  return order;
 };
 
 // Helper to convert Data URI to Uint8Array directly to avoid network stack overhead of fetch()
@@ -265,13 +312,27 @@ const App: React.FC = () => {
 
   const [compressionLevel, setCompressionLevel] = useState(50); // 1-100
 
+  const [splitMode, setSplitMode] = useState<SplitMode>('RANGE');
   const [splitRange, setSplitRange] = useState({ start: 1, end: 1 });
+  const [splitEveryN, setSplitEveryN] = useState(2);
+  const [splitCustomRanges, setSplitCustomRanges] = useState('1-2,3-4');
   const [maxPages, setMaxPages] = useState(1);
+  const [previewPage, setPreviewPage] = useState(1);
+  const [detailedPreview, setDetailedPreview] = useState<string | null>(null);
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false);
+
   const [pageToolMode, setPageToolMode] = useState<PageToolMode>('EXTRACT');
   const [pageSelection, setPageSelection] = useState('1');
   const [rotateAngle, setRotateAngle] = useState<90 | 180 | 270>(90);
+  const [reorderInput, setReorderInput] = useState('1-9999');
   const [watermarkText, setWatermarkText] = useState('CONFIDENTIAL');
   const [watermarkOpacity, setWatermarkOpacity] = useState(0.25);
+  const [metadataTitle, setMetadataTitle] = useState('');
+  const [metadataAuthor, setMetadataAuthor] = useState('');
+  const [metadataSubject, setMetadataSubject] = useState('');
+  const [ocrLanguage, setOcrLanguage] = useState<'ben' | 'eng' | 'ben+eng'>('ben+eng');
+  const [cancelRequested, setCancelRequested] = useState(false);
+  const cancelRef = useRef(false);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -282,6 +343,61 @@ const App: React.FC = () => {
       document.documentElement.classList.remove('dark');
     }
   }, [darkMode]);
+
+  const resetProcessingState = () => {
+    cancelRef.current = false;
+    setCancelRequested(false);
+    setStatus(ConversionStatus.PROCESSING);
+    setProgress(0);
+    setError(null);
+  };
+
+  const ensureNotCancelled = () => {
+    if (cancelRef.current) {
+      throw new Error(lang === 'bn' ? 'প্রসেসিং বাতিল করা হয়েছে।' : 'Processing cancelled by user.');
+    }
+  };
+
+  const renderDetailedPreview = useCallback(
+    async (file: File, pageNum: number) => {
+      if (!file || file.type !== 'application/pdf') {
+        setDetailedPreview(null);
+        return;
+      }
+      try {
+        setIsPreviewLoading(true);
+        const arrayBuffer = await file.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+        const safePage = Math.max(1, Math.min(pageNum, pdf.numPages));
+        const page = await pdf.getPage(safePage);
+        const viewport = page.getViewport({ scale: 0.9 });
+        const canvas = document.createElement('canvas');
+        const context = canvas.getContext('2d');
+        canvas.height = viewport.height;
+        canvas.width = viewport.width;
+        await page.render({ canvasContext: context, viewport }).promise;
+        setDetailedPreview(canvas.toDataURL('image/png'));
+      } catch (previewErr) {
+        console.error('Detailed preview failed', previewErr);
+        setDetailedPreview(null);
+      } finally {
+        setIsPreviewLoading(false);
+      }
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (files.length === 0 || files[0].type !== 'application/pdf') {
+      setDetailedPreview(null);
+      return;
+    }
+    renderDetailedPreview(files[0], previewPage);
+  }, [files, previewPage, renderDetailedPreview]);
+
+  useEffect(() => {
+    setPreviewPage((prev) => Math.min(Math.max(1, prev), Math.max(1, maxPages)));
+  }, [maxPages]);
 
   const generatePreview = useCallback(async (file: File) => {
     if (file.type !== 'application/pdf') return null;
@@ -364,6 +480,13 @@ const App: React.FC = () => {
           setMaxPages(pdf.numPages);
           setSplitRange({ start: 1, end: pdf.numPages });
           setPageSelection(`1-${pdf.numPages}`);
+          setReorderInput(`1-${pdf.numPages}`);
+          setPreviewPage(1);
+
+          const loadedPdf = await PDFDocument.load(arrayBuffer, { ignoreEncryption: true });
+          setMetadataTitle(loadedPdf.getTitle() || '');
+          setMetadataAuthor(loadedPdf.getAuthor() || '');
+          setMetadataSubject(loadedPdf.getSubject() || '');
         } catch (e) {
           console.error("Error reading PDF metadata", e);
         }
@@ -403,6 +526,12 @@ const App: React.FC = () => {
       setMaxPages(1);
       setSplitRange({ start: 1, end: 1 });
       setPageSelection('1');
+      setReorderInput('1');
+      setPreviewPage(1);
+      setDetailedPreview(null);
+      setMetadataTitle('');
+      setMetadataAuthor('');
+      setMetadataSubject('');
     }
   };
 
@@ -417,9 +546,7 @@ const App: React.FC = () => {
 
   const processOCR = async () => {
     if (files.length === 0) return;
-    setStatus(ConversionStatus.PROCESSING);
-    setProgress(0);
-    setError(null);
+    resetProcessingState();
     let fullExtractedText = '';
 
     try {
@@ -428,6 +555,7 @@ const App: React.FC = () => {
       const numPages = Math.min(pdf.numPages, 50); // Hard limit to prevent browser crash on huge docs
 
       for (let i = 1; i <= numPages; i++) {
+        ensureNotCancelled();
         setStatusDetail(t.pageOf.replace('{current}', i.toString()).replace('{total}', numPages.toString()));
         const page = await pdf.getPage(i);
         // Optimization: slightly lower scale if page count is high, but keeping 2.5 for quality
@@ -440,7 +568,7 @@ const App: React.FC = () => {
         const imgData = canvas.toDataURL('image/png');
         
         try {
-          const result = await Tesseract.recognize(imgData, 'ben+eng', {
+          const result = await Tesseract.recognize(imgData, ocrLanguage, {
             logger: m => {
               if (m.status === 'recognizing text') {
                 const currentProgress = Math.round(((i - 1) / numPages) * 100 + (m.progress * (100 / numPages)));
@@ -460,16 +588,19 @@ const App: React.FC = () => {
       setStatusDetail('');
     } catch (err: any) {
       console.error(err);
-      setError(err?.message || "Unknown error during OCR processing.");
-      setStatus(ConversionStatus.ERROR);
+      if ((err?.message || '').includes('cancelled')) {
+        setStatus(ConversionStatus.IDLE);
+        setStatusDetail('');
+      } else {
+        setError(err?.message || "Unknown error during OCR processing.");
+        setStatus(ConversionStatus.ERROR);
+      }
     }
   };
 
   const processCompressPDF = async () => {
     if (files.length === 0) return;
-    setStatus(ConversionStatus.PROCESSING);
-    setProgress(0);
-    setError(null);
+    resetProcessingState();
     setStatusDetail(t.compressing);
 
     try {
@@ -486,6 +617,7 @@ const App: React.FC = () => {
       const scale = compressionLevel < 30 ? 1.0 : (1.0 + (compressionLevel / 200)); 
 
       for (let i = 1; i <= total; i++) {
+        ensureNotCancelled();
         setStatusDetail(t.pageOf.replace('{current}', i.toString()).replace('{total}', total.toString()));
         const page = await pdf.getPage(i);
         const viewport = page.getViewport({ scale });
@@ -513,25 +645,30 @@ const App: React.FC = () => {
       setStatusDetail('');
     } catch (err: any) {
       console.error(err);
-      setError(err?.message || "Compression failed.");
-      setStatus(ConversionStatus.ERROR);
+      if ((err?.message || '').includes('cancelled')) {
+        setStatus(ConversionStatus.IDLE);
+        setStatusDetail('');
+      } else {
+        setError(err?.message || "Compression failed.");
+        setStatus(ConversionStatus.ERROR);
+      }
     }
   };
 
   const processPDFToImage = async () => {
     if (files.length === 0) return;
-    setStatus(ConversionStatus.PROCESSING);
-    setProgress(0);
-    setError(null);
+    resetProcessingState();
     const zip = new JSZip();
 
     try {
       for (const file of files) {
+        ensureNotCancelled();
         const arrayBuffer = await file.arrayBuffer();
         const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
         const totalPages = pdf.numPages;
         
         for (let i = 1; i <= totalPages; i++) {
+          ensureNotCancelled();
           setStatusDetail(t.pageOf.replace('{current}', i.toString()).replace('{total}', totalPages.toString()));
           const page = await pdf.getPage(i);
           const viewport = page.getViewport({ scale: imageConfig.scale });
@@ -556,16 +693,19 @@ const App: React.FC = () => {
       setStatusDetail('');
     } catch (err: any) { 
       console.error(err);
-      setError(err?.message || "Unknown error during PDF to Image conversion.");
-      setStatus(ConversionStatus.ERROR); 
+      if ((err?.message || '').includes('cancelled')) {
+        setStatus(ConversionStatus.IDLE);
+        setStatusDetail('');
+      } else {
+        setError(err?.message || "Unknown error during PDF to Image conversion.");
+        setStatus(ConversionStatus.ERROR);
+      }
     }
   };
 
   const processImageToPDF = async () => {
     if (files.length === 0) return;
-    setStatus(ConversionStatus.PROCESSING);
-    setProgress(0);
-    setError(null);
+    resetProcessingState();
     setStatusDetail(t.creatingPdf);
 
     try {
@@ -574,6 +714,7 @@ const App: React.FC = () => {
       const quality = qualityMap[pdfOutputConfig.quality];
 
       for (let i = 0; i < files.length; i++) {
+        ensureNotCancelled();
         const file = files[i];
         setStatusDetail(t.pageOf.replace('{current}', (i + 1).toString()).replace('{total}', files.length.toString()));
         
@@ -618,20 +759,24 @@ const App: React.FC = () => {
       setStatusDetail('');
     } catch (err: any) { 
       console.error(err);
-      setError(err?.message || "Unknown error during Image to PDF conversion.");
-      setStatus(ConversionStatus.ERROR); 
+      if ((err?.message || '').includes('cancelled')) {
+        setStatus(ConversionStatus.IDLE);
+        setStatusDetail('');
+      } else {
+        setError(err?.message || "Unknown error during Image to PDF conversion.");
+        setStatus(ConversionStatus.ERROR);
+      }
     }
   };
 
   const processMergePDF = async () => {
     if (files.length < 2) return;
-    setStatus(ConversionStatus.PROCESSING);
-    setProgress(0);
-    setError(null);
+    resetProcessingState();
     setStatusDetail(t.merging);
     try {
       const mergedPdf = await PDFDocument.create();
       for (let i = 0; i < files.length; i++) {
+        ensureNotCancelled();
         const file = files[i];
         const bytes = await file.arrayBuffer();
         const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
@@ -645,59 +790,90 @@ const App: React.FC = () => {
       setStatusDetail('');
     } catch (err: any) { 
       console.error(err);
-      setError(err?.message || "Unknown error during PDF merging. Ensure files are not corrupted or encrypted.");
-      setStatus(ConversionStatus.ERROR); 
+      if ((err?.message || '').includes('cancelled')) {
+        setStatus(ConversionStatus.IDLE);
+        setStatusDetail('');
+      } else {
+        setError(err?.message || "Unknown error during PDF merging. Ensure files are not corrupted or encrypted.");
+        setStatus(ConversionStatus.ERROR);
+      }
     }
   };
 
   const processSplitPDF = async () => {
     if (files.length === 0) return;
-    setStatus(ConversionStatus.PROCESSING);
-    setProgress(0);
-    setError(null);
+    resetProcessingState();
     setStatusDetail(t.splitting);
     try {
       const bytes = await files[0].arrayBuffer();
-      // Ensure we load the max pages again to be sure bounds are correct relative to the file
       const sourcePdfDoc = await PDFDocument.load(bytes, { ignoreEncryption: true });
       const totalPages = sourcePdfDoc.getPageCount();
-      
-      let start = parseInt(splitRange.start as any) || 1;
-      let end = parseInt(splitRange.end as any) || totalPages;
-      
-      // Strict validation
-      start = Math.max(1, Math.min(start, totalPages));
-      end = Math.max(1, Math.min(end, totalPages));
-      
-      if (start > end) {
-        // Swap if user messed up
-        [start, end] = [end, start];
+
+      if (splitMode === 'RANGE') {
+        let start = parseInt(splitRange.start as any, 10) || 1;
+        let end = parseInt(splitRange.end as any, 10) || totalPages;
+        start = Math.max(1, Math.min(start, totalPages));
+        end = Math.max(1, Math.min(end, totalPages));
+        if (start > end) [start, end] = [end, start];
+
+        const splitPdf = await PDFDocument.create();
+        const indices = Array.from({ length: end - start + 1 }, (_, i) => i + start - 1);
+        const copiedPages = await splitPdf.copyPages(sourcePdfDoc, indices);
+        copiedPages.forEach((page) => splitPdf.addPage(page));
+        const splitBytes = await splitPdf.save();
+        triggerDownload(new Blob([splitBytes]), `split_document_${start}-${end}.pdf`);
+      } else {
+        const zip = new JSZip();
+        const segments: Array<{ start: number; end: number }> = [];
+
+        if (splitMode === 'EVERY_N') {
+          const n = Math.max(1, Math.min(splitEveryN, totalPages));
+          for (let start = 1; start <= totalPages; start += n) {
+            segments.push({ start, end: Math.min(totalPages, start + n - 1) });
+          }
+        } else {
+          segments.push(...parseRangeSegments(splitCustomRanges, totalPages));
+        }
+
+        if (segments.length === 0) {
+          throw new Error(lang === 'bn' ? 'সঠিক split range দিন।' : 'Provide valid split ranges.');
+        }
+
+        for (let i = 0; i < segments.length; i++) {
+          ensureNotCancelled();
+          const seg = segments[i];
+          const outputPdf = await PDFDocument.create();
+          const indices = Array.from({ length: seg.end - seg.start + 1 }, (_, idx) => seg.start + idx - 1);
+          const copiedPages = await outputPdf.copyPages(sourcePdfDoc, indices);
+          copiedPages.forEach((page) => outputPdf.addPage(page));
+          const outBytes = await outputPdf.save();
+          zip.file(`split_${seg.start}-${seg.end}.pdf`, outBytes);
+          setProgress(Math.round(((i + 1) / segments.length) * 100));
+        }
+
+        const content = await zip.generateAsync({ type: 'blob' });
+        triggerDownload(content, `split_bundle_${files[0].name.replace('.pdf', '')}.zip`);
       }
 
-      const splitPdf = await PDFDocument.create();
-      const indices = Array.from({ length: end - start + 1 }, (_, i) => i + start - 1);
-      
-      const copiedPages = await splitPdf.copyPages(sourcePdfDoc, indices);
-      copiedPages.forEach(page => splitPdf.addPage(page));
-      
-      const splitBytes = await splitPdf.save();
-      triggerDownload(new Blob([splitBytes]), `split_document_${start}-${end}.pdf`);
       setStatus(ConversionStatus.COMPLETED);
       setProgress(100);
       setStatusDetail('');
     } catch (err: any) { 
       console.error(err);
-      setError(err?.message || "Unknown error during PDF splitting.");
-      setStatus(ConversionStatus.ERROR); 
+      if ((err?.message || '').includes('cancelled')) {
+        setStatus(ConversionStatus.IDLE);
+        setStatusDetail('');
+      } else {
+        setError(err?.message || "Unknown error during PDF splitting.");
+        setStatus(ConversionStatus.ERROR);
+      }
     }
   };
 
   const processPageTools = async () => {
     if (files.length === 0) return;
-    setStatus(ConversionStatus.PROCESSING);
-    setProgress(0);
-    setError(null);
-    setStatusDetail(lang === 'bn' ? 'পেজ টুলস প্রসেস হচ্ছে...' : 'Processing page tools...');
+    resetProcessingState();
+    setStatusDetail(lang === 'bn' ? '??? ???? ?????? ?????...' : 'Processing page tools...');
 
     try {
       const bytes = await files[0].arrayBuffer();
@@ -705,13 +881,14 @@ const App: React.FC = () => {
       const totalPages = sourcePdfDoc.getPageCount();
       const selectedPages = parsePageSelection(pageSelection, totalPages);
 
-      if (selectedPages.length === 0 && pageToolMode !== 'PAGE_NUMBERS') {
-        throw new Error(lang === 'bn' ? 'সঠিক পেজ নির্বাচন করুন (যেমন: 1-3,5)' : 'Select valid pages (e.g. 1-3,5)');
+      if (selectedPages.length === 0 && !['PAGE_NUMBERS', 'REORDER', 'METADATA'].includes(pageToolMode)) {
+        throw new Error(lang === 'bn' ? '???? ??? ???????? ???? (????: 1-3,5)' : 'Select valid pages (e.g. 1-3,5)');
       }
 
       if (pageToolMode === 'ROTATE') {
         const pages = sourcePdfDoc.getPages();
         selectedPages.forEach((pageNum, idx) => {
+          ensureNotCancelled();
           const page = pages[pageNum - 1];
           page.setRotation(degrees(rotateAngle));
           setProgress(Math.round(((idx + 1) / selectedPages.length) * 100));
@@ -722,6 +899,7 @@ const App: React.FC = () => {
         const font = await sourcePdfDoc.embedFont(StandardFonts.HelveticaBold);
         const pages = sourcePdfDoc.getPages();
         selectedPages.forEach((pageNum, idx) => {
+          ensureNotCancelled();
           const page = pages[pageNum - 1];
           const { width, height } = page.getSize();
           const fontSize = Math.min(width, height) / 10;
@@ -742,6 +920,7 @@ const App: React.FC = () => {
         const font = await sourcePdfDoc.embedFont(StandardFonts.Helvetica);
         const pages = sourcePdfDoc.getPages();
         pages.forEach((page, idx) => {
+          ensureNotCancelled();
           const label = `${idx + 1} / ${pages.length}`;
           const size = 12;
           const textWidth = font.widthOfTextAtSize(label, size);
@@ -757,6 +936,27 @@ const App: React.FC = () => {
         });
         const updated = await sourcePdfDoc.save();
         triggerDownload(new Blob([updated], { type: 'application/pdf' }), `numbered_${files[0].name}`);
+      } else if (pageToolMode === 'REORDER') {
+        const order = parsePageOrder(reorderInput, totalPages);
+        const outputPdf = await PDFDocument.create();
+        const indices = order.map((page) => page - 1);
+        const copiedPages = await outputPdf.copyPages(sourcePdfDoc, indices);
+        copiedPages.forEach((page, idx) => {
+          ensureNotCancelled();
+          outputPdf.addPage(page);
+          setProgress(Math.round(((idx + 1) / copiedPages.length) * 100));
+        });
+        const updated = await outputPdf.save();
+        triggerDownload(new Blob([updated], { type: 'application/pdf' }), `reordered_${files[0].name}`);
+      } else if (pageToolMode === 'METADATA') {
+        sourcePdfDoc.setTitle(metadataTitle || '');
+        sourcePdfDoc.setAuthor(metadataAuthor || '');
+        sourcePdfDoc.setSubject(metadataSubject || '');
+        sourcePdfDoc.setProducer('PDF Nova');
+        sourcePdfDoc.setCreator('PDF Nova');
+        const updated = await sourcePdfDoc.save();
+        setProgress(100);
+        triggerDownload(new Blob([updated], { type: 'application/pdf' }), `metadata_updated_${files[0].name}`);
       } else {
         const outputPdf = await PDFDocument.create();
         const keepSet = new Set(selectedPages.map((p) => p - 1));
@@ -766,11 +966,12 @@ const App: React.FC = () => {
             : Array.from({ length: totalPages }, (_, i) => i).filter((idx) => !keepSet.has(idx));
 
         if (pageIndices.length === 0) {
-          throw new Error(lang === 'bn' ? 'সব পেজ মুছে ফেলা যাবে না।' : 'Cannot remove all pages.');
+          throw new Error(lang === 'bn' ? '?? ??? ???? ???? ???? ???' : 'Cannot remove all pages.');
         }
 
         const copiedPages = await outputPdf.copyPages(sourcePdfDoc, pageIndices);
         copiedPages.forEach((page, idx) => {
+          ensureNotCancelled();
           outputPdf.addPage(page);
           setProgress(Math.round(((idx + 1) / copiedPages.length) * 100));
         });
@@ -783,27 +984,43 @@ const App: React.FC = () => {
       setStatusDetail('');
     } catch (err: any) {
       console.error(err);
-      setError(err?.message || (lang === 'bn' ? 'পেজ টুলস প্রসেস ব্যর্থ হয়েছে।' : 'Page tools processing failed.'));
-      setStatus(ConversionStatus.ERROR);
+      if ((err?.message || '').includes('cancelled')) {
+        setStatus(ConversionStatus.IDLE);
+        setStatusDetail('');
+      } else {
+        setError(err?.message || (lang === 'bn' ? '??? ???? ?????? ?????? ??????' : 'Page tools processing failed.'));
+        setStatus(ConversionStatus.ERROR);
+      }
     }
   };
-
   const resetTool = () => {
     setFiles([]);
     setPreviews([]);
+    setDetailedPreview(null);
+    setPreviewPage(1);
     setAiSummary(null);
     setStatus(ConversionStatus.IDLE);
     setProgress(0);
     setStatusDetail('');
     setError(null);
     setOcrText(null);
+    setCancelRequested(false);
+    cancelRef.current = false;
+    setSplitMode('RANGE');
     setMaxPages(1);
     setSplitRange({ start: 1, end: 1 });
+    setSplitEveryN(2);
+    setSplitCustomRanges('1-2,3-4');
     setPageToolMode('EXTRACT');
     setPageSelection('1');
     setRotateAngle(90);
+    setReorderInput('1');
     setWatermarkText('CONFIDENTIAL');
     setWatermarkOpacity(0.25);
+    setMetadataTitle('');
+    setMetadataAuthor('');
+    setMetadataSubject('');
+    setOcrLanguage('ben+eng');
   };
 
   const navigateTo = (newView: ViewType, tool: ToolType | null = null) => {
@@ -821,7 +1038,7 @@ const App: React.FC = () => {
     {
       id: 'PAGE_TOOLS',
       title: lang === 'bn' ? 'পেজ টুলস' : 'Page Tools',
-      desc: lang === 'bn' ? 'Rotate, Delete, Extract, Watermark, Numbering' : 'Rotate, Delete, Extract, Watermark, Numbering',
+      desc: lang === 'bn' ? 'Rotate, Delete, Extract, Watermark, Numbering, Reorder, Metadata' : 'Rotate, Delete, Extract, Watermark, Numbering, Reorder, Metadata',
       icon: Layers,
       gradient: 'from-cyan-500 via-blue-600 to-indigo-700'
     },
@@ -1053,6 +1270,42 @@ const App: React.FC = () => {
                   )}
                 </div>
 
+                {files.length > 0 && files[0].type === 'application/pdf' && (
+                  <div className="bg-white/80 dark:bg-slate-800/80 glass rounded-[3rem] p-8 md:p-10 shadow-2xl">
+                    <div className="flex items-center justify-between gap-4 mb-6">
+                      <h4 className="text-2xl font-black text-slate-900 dark:text-white tracking-tight">
+                        {lang === 'bn' ? 'ডিটেইলড প্রিভিউ' : 'Detailed Preview'}
+                      </h4>
+                      <div className="flex items-center gap-3">
+                        <button
+                          onClick={() => setPreviewPage((p) => Math.max(1, p - 1))}
+                          className="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 font-black text-xs"
+                        >
+                          {lang === 'bn' ? 'Prev' : 'Prev'}
+                        </button>
+                        <span className="text-xs font-black text-slate-500 dark:text-slate-400 min-w-[80px] text-center">
+                          {previewPage} / {maxPages}
+                        </span>
+                        <button
+                          onClick={() => setPreviewPage((p) => Math.min(maxPages, p + 1))}
+                          className="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 font-black text-xs"
+                        >
+                          {lang === 'bn' ? 'Next' : 'Next'}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="rounded-2xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/50 p-3 min-h-[260px] flex items-center justify-center">
+                      {isPreviewLoading ? (
+                        <Loader2 className="w-8 h-8 animate-spin text-indigo-500" />
+                      ) : detailedPreview ? (
+                        <img src={detailedPreview} alt="Detailed PDF Preview" className="w-full h-auto rounded-xl object-contain max-h-[480px]" />
+                      ) : (
+                        <span className="text-sm font-bold text-slate-400">{lang === 'bn' ? 'প্রিভিউ পাওয়া যায়নি' : 'Preview unavailable'}</span>
+                      )}
+                    </div>
+                  </div>
+                )}
+
                 {activeTool === 'OCR_PDF' && ocrText && (
                   <div className="space-y-8 animate-in slide-in-from-bottom-10 duration-700">
                     <div className="p-6 bg-amber-50 dark:bg-amber-900/20 border-l-4 border-amber-400 rounded-xl flex items-center gap-4">
@@ -1079,6 +1332,20 @@ const App: React.FC = () => {
                           >
                             <Download className="w-5 h-5" />
                             {t.downloadWord}
+                          </button>
+                          <button 
+                            onClick={() => triggerDownload(new Blob([ocrText || ''], { type: 'text/plain;charset=utf-8' }), 'extracted_text.txt')}
+                            className="flex items-center gap-3 px-6 py-4 rounded-2xl font-black text-sm transition-all shadow-xl hover:-translate-y-1 bg-gradient-to-r from-slate-700 to-slate-900 text-white"
+                          >
+                            <Download className="w-5 h-5" />
+                            TXT
+                          </button>
+                          <button 
+                            onClick={() => triggerDownload(new Blob([`# OCR Output\n\n${ocrText || ''}`], { type: 'text/markdown;charset=utf-8' }), 'extracted_text.md')}
+                            className="flex items-center gap-3 px-6 py-4 rounded-2xl font-black text-sm transition-all shadow-xl hover:-translate-y-1 bg-gradient-to-r from-emerald-600 to-teal-700 text-white"
+                          >
+                            <Download className="w-5 h-5" />
+                            MD
                           </button>
                           <button 
                             onClick={() => {
@@ -1203,30 +1470,104 @@ const App: React.FC = () => {
 
                       {activeTool === 'SPLIT_PDF' && (
                         <div className="space-y-8">
-                          <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">{t.splitRange}</label>
-                          <div className="flex gap-4">
-                            <div className="flex-1 space-y-3">
-                              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{t.from}</span>
-                              <input 
-                                type="number" min="1" max={maxPages}
-                                value={splitRange.start}
-                                onChange={(e) => setSplitRange(prev => ({...prev, start: parseInt(e.target.value) || 1}))}
-                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-indigo-500 rounded-2xl p-5 font-black text-xl text-indigo-600 dark:text-indigo-400 shadow-inner transition-all outline-none"
-                              />
-                            </div>
-                            <div className="flex-1 space-y-3">
-                              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{t.to}</span>
-                              <input 
-                                type="number" min="1" max={maxPages}
-                                value={splitRange.end}
-                                onChange={(e) => setSplitRange(prev => ({...prev, end: parseInt(e.target.value) || 1}))}
-                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-indigo-500 rounded-2xl p-5 font-black text-xl text-indigo-600 dark:text-indigo-400 shadow-inner transition-all outline-none"
-                              />
-                            </div>
+                          <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">
+                            {lang === 'bn' ? 'স্প্লিট মোড' : 'Split Mode'}
+                          </label>
+                          <div className="grid grid-cols-3 gap-3 p-2 bg-slate-100/50 dark:bg-slate-900/50 rounded-2xl shadow-inner">
+                            {[
+                              { id: 'RANGE', labelBn: 'Range', labelEn: 'Range' },
+                              { id: 'EVERY_N', labelBn: 'Every N', labelEn: 'Every N' },
+                              { id: 'CUSTOM', labelBn: 'Custom', labelEn: 'Custom' }
+                            ].map((mode) => (
+                              <button
+                                key={mode.id}
+                                onClick={() => setSplitMode(mode.id as SplitMode)}
+                                className={`py-3 text-[11px] font-black uppercase rounded-xl transition-all ${splitMode === mode.id ? 'bg-white dark:bg-slate-700 shadow-md text-indigo-600 dark:text-indigo-300' : 'text-slate-400 hover:text-slate-600'}`}
+                              >
+                                {lang === 'bn' ? mode.labelBn : mode.labelEn}
+                              </button>
+                            ))}
                           </div>
+
+                          {splitMode === 'RANGE' && (
+                            <div className="flex gap-4">
+                              <div className="flex-1 space-y-3">
+                                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{t.from}</span>
+                                <input 
+                                  type="number" min="1" max={maxPages}
+                                  value={splitRange.start}
+                                  onChange={(e) => setSplitRange(prev => ({...prev, start: parseInt(e.target.value) || 1}))}
+                                  className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-indigo-500 rounded-2xl p-5 font-black text-xl text-indigo-600 dark:text-indigo-400 shadow-inner transition-all outline-none"
+                                />
+                              </div>
+                              <div className="flex-1 space-y-3">
+                                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{t.to}</span>
+                                <input 
+                                  type="number" min="1" max={maxPages}
+                                  value={splitRange.end}
+                                  onChange={(e) => setSplitRange(prev => ({...prev, end: parseInt(e.target.value) || 1}))}
+                                  className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-indigo-500 rounded-2xl p-5 font-black text-xl text-indigo-600 dark:text-indigo-400 shadow-inner transition-all outline-none"
+                                />
+                              </div>
+                            </div>
+                          )}
+
+                          {splitMode === 'EVERY_N' && (
+                            <div className="space-y-3">
+                              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                                {lang === 'bn' ? 'প্রতি ফাইলে পেজ সংখ্যা' : 'Pages Per Split'}
+                              </span>
+                              <input
+                                type="number"
+                                min="1"
+                                max={Math.max(1, maxPages)}
+                                value={splitEveryN}
+                                onChange={(e) => setSplitEveryN(parseInt(e.target.value, 10) || 1)}
+                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-indigo-500 rounded-2xl p-4 font-black text-xl text-indigo-600 dark:text-indigo-400 shadow-inner transition-all outline-none"
+                              />
+                            </div>
+                          )}
+
+                          {splitMode === 'CUSTOM' && (
+                            <div className="space-y-3">
+                              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                                {lang === 'bn' ? 'কাস্টম রেঞ্জ (যেমন: 1-2,5-7)' : 'Custom Ranges (e.g. 1-2,5-7)'}
+                              </span>
+                              <input
+                                type="text"
+                                value={splitCustomRanges}
+                                onChange={(e) => setSplitCustomRanges(e.target.value)}
+                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-indigo-500 rounded-2xl p-4 font-bold text-sm text-indigo-700 dark:text-indigo-300 shadow-inner transition-all outline-none"
+                              />
+                            </div>
+                          )}
+
                           <div className="p-4 rounded-2xl bg-indigo-50 dark:bg-indigo-900/20 flex justify-between items-center">
                             <span className="text-xs font-bold text-indigo-600 dark:text-indigo-400 uppercase tracking-widest">{t.totalPages}</span>
                             <span className="text-2xl font-black text-indigo-700 dark:text-indigo-300">{maxPages}</span>
+                          </div>
+                        </div>
+                      )}
+
+                      {activeTool === 'OCR_PDF' && (
+                        <div className="space-y-6">
+                          <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">
+                            {lang === 'bn' ? 'OCR ভাষা' : 'OCR Language'}
+                          </label>
+                          <div className="grid grid-cols-3 gap-3 p-2 bg-slate-100/50 dark:bg-slate-900/50 rounded-2xl shadow-inner">
+                            {[
+                              { id: 'ben', label: 'বাংলা' },
+                              { id: 'eng', label: 'English' },
+                              { id: 'ben+eng', label: 'বাংলা+EN' },
+                            ].map((opt) => (
+                              <button
+                                key={opt.id}
+                                onClick={() => setOcrLanguage(opt.id as 'ben' | 'eng' | 'ben+eng')}
+                                className={`py-3 text-[11px] font-black uppercase rounded-xl transition-all ${ocrLanguage === opt.id ? 'bg-white dark:bg-slate-700 shadow-md text-violet-600 dark:text-violet-300' : 'text-slate-400 hover:text-slate-600'}`}
+                              >
+                                {opt.label}
+                              </button>
+                            ))}
                           </div>
                         </div>
                       )}
@@ -1244,6 +1585,8 @@ const App: React.FC = () => {
                                 { id: 'ROTATE', labelBn: 'Rotate', labelEn: 'Rotate' },
                                 { id: 'WATERMARK', labelBn: 'Watermark', labelEn: 'Watermark' },
                                 { id: 'PAGE_NUMBERS', labelBn: 'Page No.', labelEn: 'Page No.' },
+                                { id: 'REORDER', labelBn: 'Reorder', labelEn: 'Reorder' },
+                                { id: 'METADATA', labelBn: 'Metadata', labelEn: 'Metadata' },
                               ].map((mode) => (
                                 <button
                                   key={mode.id}
@@ -1256,7 +1599,7 @@ const App: React.FC = () => {
                             </div>
                           </div>
 
-                          {pageToolMode !== 'PAGE_NUMBERS' && (
+                          {!['PAGE_NUMBERS', 'REORDER', 'METADATA'].includes(pageToolMode) && (
                             <div className="space-y-3">
                               <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">
                                 {lang === 'bn' ? 'পেজ সিলেকশন (যেমন 1-3,5)' : 'Page Selection (e.g. 1-3,5)'}
@@ -1265,6 +1608,20 @@ const App: React.FC = () => {
                                 type="text"
                                 value={pageSelection}
                                 onChange={(e) => setPageSelection(e.target.value)}
+                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-cyan-500 rounded-2xl p-4 font-bold text-sm text-cyan-700 dark:text-cyan-300 shadow-inner transition-all outline-none"
+                              />
+                            </div>
+                          )}
+
+                          {pageToolMode === 'REORDER' && (
+                            <div className="space-y-3">
+                              <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">
+                                {lang === 'bn' ? 'নতুন অর্ডার (যেমন: 3,1,2 বা 2-5,1)' : 'Custom order (e.g. 3,1,2 or 2-5,1)'}
+                              </label>
+                              <input
+                                type="text"
+                                value={reorderInput}
+                                onChange={(e) => setReorderInput(e.target.value)}
                                 className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-cyan-500 rounded-2xl p-4 font-bold text-sm text-cyan-700 dark:text-cyan-300 shadow-inner transition-all outline-none"
                               />
                             </div>
@@ -1317,6 +1674,32 @@ const App: React.FC = () => {
                               </div>
                             </div>
                           )}
+
+                          {pageToolMode === 'METADATA' && (
+                            <div className="space-y-4">
+                              <input
+                                type="text"
+                                value={metadataTitle}
+                                onChange={(e) => setMetadataTitle(e.target.value)}
+                                placeholder={lang === 'bn' ? 'Title' : 'Title'}
+                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-cyan-500 rounded-2xl p-4 font-bold text-sm text-cyan-700 dark:text-cyan-300 shadow-inner transition-all outline-none"
+                              />
+                              <input
+                                type="text"
+                                value={metadataAuthor}
+                                onChange={(e) => setMetadataAuthor(e.target.value)}
+                                placeholder={lang === 'bn' ? 'Author' : 'Author'}
+                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-cyan-500 rounded-2xl p-4 font-bold text-sm text-cyan-700 dark:text-cyan-300 shadow-inner transition-all outline-none"
+                              />
+                              <input
+                                type="text"
+                                value={metadataSubject}
+                                onChange={(e) => setMetadataSubject(e.target.value)}
+                                placeholder={lang === 'bn' ? 'Subject' : 'Subject'}
+                                className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-cyan-500 rounded-2xl p-4 font-bold text-sm text-cyan-700 dark:text-cyan-300 shadow-inner transition-all outline-none"
+                              />
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
@@ -1334,6 +1717,16 @@ const App: React.FC = () => {
                          <div className="h-5 bg-white/10 rounded-full overflow-hidden p-1 shadow-inner">
                             <div className="h-full bg-gradient-to-r from-indigo-500 via-pink-500 to-indigo-500 rounded-full transition-all duration-500 animate-pulse" style={{ width: `${progress}%` }} />
                          </div>
+                         <button
+                           onClick={() => {
+                             cancelRef.current = true;
+                             setCancelRequested(true);
+                           }}
+                           disabled={cancelRequested}
+                           className={`w-full py-4 rounded-2xl font-black text-sm transition-all ${cancelRequested ? 'bg-slate-700 text-slate-300' : 'bg-rose-600 hover:bg-rose-700 text-white'}`}
+                         >
+                           {cancelRequested ? (lang === 'bn' ? 'বাতিলের অপেক্ষায়...' : 'Cancelling...') : (lang === 'bn' ? 'প্রসেস বাতিল করুন' : 'Cancel Processing')}
+                         </button>
                       </div>
                     ) : status === ConversionStatus.COMPLETED ? (
                       <div className="bg-emerald-50 dark:bg-emerald-900/10 border-2 border-emerald-100 dark:border-emerald-800/20 rounded-[3rem] p-12 text-center animate-in zoom-in-95 duration-500 space-y-8 shadow-2xl shadow-emerald-100 dark:shadow-none">
