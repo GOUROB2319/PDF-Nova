@@ -21,8 +21,11 @@ declare const pdfjsLib: any;
 type ViewType = 'HOME' | 'TOOL' | 'PRIVACY' | 'SAFETY' | 'OPENSOURCE';
 type PageToolMode = 'EXTRACT' | 'DELETE' | 'ROTATE' | 'WATERMARK' | 'PAGE_NUMBERS' | 'REORDER' | 'METADATA';
 type SplitMode = 'RANGE' | 'EVERY_N' | 'CUSTOM';
+type SecurityMode = 'LOCK' | 'UNLOCK';
+type PerformanceMode = 'BALANCED' | 'MEMORY';
 
 const MAX_TOTAL_FILE_BYTES = 1024 * 1024 * 1024; // 1GB
+const PBKDF2_ITERATIONS = 150000;
 
 const parsePageSelection = (input: string, totalPages: number): number[] => {
   const cleaned = (input || '').replace(/\s+/g, '');
@@ -101,6 +104,68 @@ const parsePageOrder = (input: string, totalPages: number): number[] => {
   return order;
 };
 
+const bytesToBase64 = (bytes: Uint8Array): string => {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+};
+
+const base64ToBytes = (value: string): Uint8Array => {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+};
+
+const deriveKey = async (password: string, salt: Uint8Array) => {
+  const encoder = new TextEncoder();
+  const baseKey = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt,
+      iterations: PBKDF2_ITERATIONS,
+      hash: 'SHA-256',
+    },
+    baseKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+};
+
+const encryptBytesWithPassword = async (bytes: Uint8Array, password: string): Promise<string> => {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveKey(password, salt);
+  const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, bytes);
+  return JSON.stringify({
+    v: 1,
+    alg: 'AES-GCM',
+    iter: PBKDF2_ITERATIONS,
+    salt: bytesToBase64(salt),
+    iv: bytesToBase64(iv),
+    data: bytesToBase64(new Uint8Array(encrypted)),
+  });
+};
+
+const decryptBytesWithPassword = async (payloadRaw: string, password: string): Promise<Uint8Array> => {
+  const payload = JSON.parse(payloadRaw);
+  if (!payload?.salt || !payload?.iv || !payload?.data) {
+    throw new Error('Invalid encrypted file format.');
+  }
+  const salt = base64ToBytes(payload.salt);
+  const iv = base64ToBytes(payload.iv);
+  const data = base64ToBytes(payload.data);
+  const key = await deriveKey(password, salt);
+  const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data);
+  return new Uint8Array(decrypted);
+};
+
 // Helper to convert Data URI to Uint8Array directly to avoid network stack overhead of fetch()
 const dataURItoUint8Array = (dataURI: string) => {
   try {
@@ -115,6 +180,14 @@ const dataURItoUint8Array = (dataURI: string) => {
     console.error("Error converting Data URI", e);
     return new Uint8Array(0);
   }
+};
+
+const canvasToJpegBytes = async (canvas: HTMLCanvasElement, quality: number): Promise<Uint8Array> => {
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Failed to create JPEG blob'))), 'image/jpeg', quality);
+  });
+  const buffer = await blob.arrayBuffer();
+  return new Uint8Array(buffer);
 };
 
 const translations = {
@@ -333,6 +406,9 @@ const App: React.FC = () => {
   const [ocrLanguage, setOcrLanguage] = useState<'ben' | 'eng' | 'ben+eng'>('ben+eng');
   const [cancelRequested, setCancelRequested] = useState(false);
   const cancelRef = useRef(false);
+  const [performanceMode, setPerformanceMode] = useState<PerformanceMode>('BALANCED');
+  const [securityMode, setSecurityMode] = useState<SecurityMode>('UNLOCK');
+  const [securityPassword, setSecurityPassword] = useState('');
   
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -357,6 +433,11 @@ const App: React.FC = () => {
       throw new Error(lang === 'bn' ? 'প্রসেসিং বাতিল করা হয়েছে।' : 'Processing cancelled by user.');
     }
   };
+
+  const getTaskScale = (balancedValue: number, memoryValue: number) =>
+    performanceMode === 'MEMORY' ? memoryValue : balancedValue;
+
+  const yieldToUI = async () => new Promise((resolve) => setTimeout(resolve, 0));
 
   const renderDetailedPreview = useCallback(
     async (file: File, pageNum: number) => {
@@ -443,17 +524,22 @@ const App: React.FC = () => {
     if (activeTool === 'IMAGE_TO_PDF') {
       const nonImages = selectedFiles.filter(f => !f.type.startsWith('image/'));
       if (nonImages.length > 0) {
-        setError(lang === 'bn' ? 'শুধুমাত্র ছবি সিলেক্ট করুন।' : 'Please select image files only.');
+        setError(lang === 'bn' ? '????????? ??? ??????? ?????' : 'Please select image files only.');
+        return;
+      }
+    } else if (activeTool === 'SECURITY_PDF') {
+      const invalidFiles = selectedFiles.filter((f) => !(f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pnova')));
+      if (invalidFiles.length > 0) {
+        setError(lang === 'bn' ? '????????? PDF ?? .pnova ???? ??????? ?????' : 'Please select PDF or .pnova files only.');
         return;
       }
     } else {
       const nonPdfs = selectedFiles.filter(f => f.type !== 'application/pdf');
       if (nonPdfs.length > 0) {
-        setError(lang === 'bn' ? 'শুধুমাত্র পিডিএফ সিলেক্ট করুন।' : 'Please select PDF files only.');
+        setError(lang === 'bn' ? '????????? ?????? ??????? ?????' : 'Please select PDF files only.');
         return;
       }
     }
-
     setFiles(prev => [...prev, ...selectedFiles]);
     setError(null);
 
@@ -473,7 +559,7 @@ const App: React.FC = () => {
 
       // Set max pages based on the *first* file added if the list was empty,
       // or just assume we focus on the first file for Splitting/OCR.
-      if (files.length === 0 && selectedFiles.length > 0) {
+      if (files.length === 0 && selectedFiles.length > 0 && selectedFiles[0].type === 'application/pdf') {
         try {
           const arrayBuffer = await selectedFiles[0].arrayBuffer();
           const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
@@ -552,14 +638,14 @@ const App: React.FC = () => {
     try {
       const arrayBuffer = await files[0].arrayBuffer();
       const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-      const numPages = Math.min(pdf.numPages, 50); // Hard limit to prevent browser crash on huge docs
+      const ocrCap = performanceMode === 'MEMORY' ? 35 : 60;
+      const numPages = Math.min(pdf.numPages, ocrCap);
 
       for (let i = 1; i <= numPages; i++) {
         ensureNotCancelled();
         setStatusDetail(t.pageOf.replace('{current}', i.toString()).replace('{total}', numPages.toString()));
         const page = await pdf.getPage(i);
-        // Optimization: slightly lower scale if page count is high, but keeping 2.5 for quality
-        const viewport = page.getViewport({ scale: 2.5 });
+        const viewport = page.getViewport({ scale: getTaskScale(2.2, 1.4) });
         const canvas = document.createElement('canvas');
         const context = canvas.getContext('2d');
         canvas.height = viewport.height;
@@ -581,6 +667,7 @@ const App: React.FC = () => {
           console.error(`OCR Error on page ${i}`, tessErr);
           fullExtractedText += `--- Page ${i} (Error) ---\nFailed to read text.\n\n`;
         }
+        await yieldToUI();
       }
       setOcrText(fullExtractedText || t.noText);
       setStatus(ConversionStatus.COMPLETED);
@@ -613,8 +700,7 @@ const App: React.FC = () => {
       // compressionLevel 10 (High compression, Low Quality) -> quality 0.1
       // compressionLevel 90 (Low compression, High Quality) -> quality 0.9
       const quality = Math.max(0.1, Math.min(0.9, compressionLevel / 100));
-      // Scale: Lower scale for higher compression to reduce pixel count
-      const scale = compressionLevel < 30 ? 1.0 : (1.0 + (compressionLevel / 200)); 
+      const scale = compressionLevel < 30 ? getTaskScale(1.0, 0.8) : getTaskScale(1.2 + (compressionLevel / 250), 0.9 + (compressionLevel / 300));
 
       for (let i = 1; i <= total; i++) {
         ensureNotCancelled();
@@ -627,16 +713,14 @@ const App: React.FC = () => {
         canvas.width = viewport.width;
         await page.render({ canvasContext: context, viewport }).promise;
         
-        const imgData = canvas.toDataURL('image/jpeg', quality);
-        
-        // Optimization: Use Direct Uint8Array conversion instead of fetch
-        const imageBytes = dataURItoUint8Array(imgData);
+        const imageBytes = await canvasToJpegBytes(canvas, quality);
         
         const pdfImage = await outPdf.embedJpg(imageBytes);
         const newPage = outPdf.addPage([pdfImage.width, pdfImage.height]);
         newPage.drawImage(pdfImage, { x: 0, y: 0, width: pdfImage.width, height: pdfImage.height });
         
         setProgress(Math.round((i / total) * 100));
+        await yieldToUI();
       }
 
       const pdfBytes = await outPdf.save();
@@ -671,7 +755,7 @@ const App: React.FC = () => {
           ensureNotCancelled();
           setStatusDetail(t.pageOf.replace('{current}', i.toString()).replace('{total}', totalPages.toString()));
           const page = await pdf.getPage(i);
-          const viewport = page.getViewport({ scale: imageConfig.scale });
+          const viewport = page.getViewport({ scale: performanceMode === 'MEMORY' ? Math.min(imageConfig.scale, 1.5) : imageConfig.scale });
           const canvas = document.createElement('canvas');
           const context = canvas.getContext('2d');
           canvas.height = viewport.height; canvas.width = viewport.width;
@@ -684,6 +768,7 @@ const App: React.FC = () => {
           // but explicit split is safer given the existing implementation style.
           zip.file(`${file.name.replace('.pdf', '')}_page-${i}.${ext}`, imgData.split(',')[1], { base64: true });
           setProgress(Math.round(((i / totalPages) * 100)));
+          await yieldToUI();
         }
       }
       setStatusDetail(lang === 'bn' ? 'জিপ ফাইল তৈরি হচ্ছে...' : 'Creating zip file...');
@@ -737,9 +822,7 @@ const App: React.FC = () => {
         canvas.height = img.height;
         ctx?.drawImage(img, 0, 0);
         
-        const compressedDataUrl = canvas.toDataURL('image/jpeg', quality);
-        // Optimization: Use Direct Uint8Array conversion
-        const imageBytes = dataURItoUint8Array(compressedDataUrl);
+        const imageBytes = await canvasToJpegBytes(canvas, quality);
         
         const pdfImage = await pdfDoc.embedJpg(imageBytes);
         const page = pdfDoc.addPage([pdfImage.width, pdfImage.height]);
@@ -751,6 +834,7 @@ const App: React.FC = () => {
         });
 
         setProgress(Math.round(((i + 1) / files.length) * 100));
+        await yieldToUI();
       }
 
       const pdfBytes = await pdfDoc.save();
@@ -783,6 +867,7 @@ const App: React.FC = () => {
         const copiedPages = await mergedPdf.copyPages(pdf, pdf.getPageIndices());
         copiedPages.forEach((page) => mergedPdf.addPage(page));
         setProgress(Math.round(((i + 1) / files.length) * 100));
+        await yieldToUI();
       }
       const mergedBytes = await mergedPdf.save();
       triggerDownload(new Blob([mergedBytes]), 'merged_document.pdf');
@@ -849,6 +934,7 @@ const App: React.FC = () => {
           const outBytes = await outputPdf.save();
           zip.file(`split_${seg.start}-${seg.end}.pdf`, outBytes);
           setProgress(Math.round(((i + 1) / segments.length) * 100));
+          await yieldToUI();
         }
 
         const content = await zip.generateAsync({ type: 'blob' });
@@ -865,6 +951,82 @@ const App: React.FC = () => {
         setStatusDetail('');
       } else {
         setError(err?.message || "Unknown error during PDF splitting.");
+        setStatus(ConversionStatus.ERROR);
+      }
+    }
+  };
+
+  const processSecurityPDF = async () => {
+    if (files.length === 0) return;
+    resetProcessingState();
+    setStatusDetail(lang === 'bn' ? 'সিকিউরিটি প্রসেস চলছে...' : 'Running security workflow...');
+
+    try {
+      const file = files[0];
+      const lowerName = file.name.toLowerCase();
+      const password = securityPassword.trim();
+      if (!password) {
+        throw new Error(lang === 'bn' ? 'পাসওয়ার্ড দিন।' : 'Please provide a password.');
+      }
+
+      if (securityMode === 'LOCK') {
+        if (file.type !== 'application/pdf') {
+          throw new Error(lang === 'bn' ? 'Lock mode শুধু PDF এর জন্য।' : 'Lock mode supports PDF only.');
+        }
+        const raw = new Uint8Array(await file.arrayBuffer());
+        const payload = await encryptBytesWithPassword(raw, password);
+        const blob = new Blob([payload], { type: 'application/octet-stream' });
+        const safeName = file.name.replace(/\.pdf$/i, '');
+        triggerDownload(blob, `${safeName}.pnova`);
+        setProgress(100);
+      } else {
+        if (lowerName.endsWith('.pnova')) {
+          const rawPayload = await file.text();
+          const decrypted = await decryptBytesWithPassword(rawPayload, password);
+          triggerDownload(new Blob([decrypted], { type: 'application/pdf' }), `${file.name.replace(/\.pnova$/i, '')}_unlocked.pdf`);
+          setProgress(100);
+        } else {
+          if (file.type !== 'application/pdf') {
+            throw new Error(lang === 'bn' ? 'Unlock mode এ PDF বা .pnova দিন।' : 'Unlock mode accepts PDF or .pnova.');
+          }
+
+          const arrayBuffer = await file.arrayBuffer();
+          const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer, password });
+          const pdf = await loadingTask.promise;
+          const outPdf = await PDFDocument.create();
+
+          for (let i = 1; i <= pdf.numPages; i++) {
+            ensureNotCancelled();
+            setStatusDetail(`${lang === 'bn' ? 'পাসওয়ার্ড আনলক' : 'Password unlock'} ${i}/${pdf.numPages}`);
+            const page = await pdf.getPage(i);
+            const viewport = page.getViewport({ scale: getTaskScale(1.9, 1.2) });
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d');
+            canvas.width = viewport.width;
+            canvas.height = viewport.height;
+            await page.render({ canvasContext: context, viewport }).promise;
+            const jpgBytes = await canvasToJpegBytes(canvas, 0.9);
+            const image = await outPdf.embedJpg(jpgBytes);
+            const outPage = outPdf.addPage([image.width, image.height]);
+            outPage.drawImage(image, { x: 0, y: 0, width: image.width, height: image.height });
+            setProgress(Math.round((i / pdf.numPages) * 100));
+            await yieldToUI();
+          }
+
+          const unlockedBytes = await outPdf.save();
+          triggerDownload(new Blob([unlockedBytes], { type: 'application/pdf' }), `${file.name.replace(/\\.pdf$/i, '')}_unlocked.pdf`);
+        }
+      }
+
+      setStatus(ConversionStatus.COMPLETED);
+      setStatusDetail('');
+    } catch (err: any) {
+      console.error(err);
+      if ((err?.message || '').includes('cancelled')) {
+        setStatus(ConversionStatus.IDLE);
+        setStatusDetail('');
+      } else {
+        setError(err?.message || (lang === 'bn' ? 'সিকিউরিটি প্রসেস ব্যর্থ হয়েছে।' : 'Security workflow failed.'));
         setStatus(ConversionStatus.ERROR);
       }
     }
@@ -1021,6 +1183,9 @@ const App: React.FC = () => {
     setMetadataAuthor('');
     setMetadataSubject('');
     setOcrLanguage('ben+eng');
+    setSecurityMode('UNLOCK');
+    setSecurityPassword('');
+    setPerformanceMode('BALANCED');
   };
 
   const navigateTo = (newView: ViewType, tool: ToolType | null = null) => {
@@ -1041,6 +1206,13 @@ const App: React.FC = () => {
       desc: lang === 'bn' ? 'Rotate, Delete, Extract, Watermark, Numbering, Reorder, Metadata' : 'Rotate, Delete, Extract, Watermark, Numbering, Reorder, Metadata',
       icon: Layers,
       gradient: 'from-cyan-500 via-blue-600 to-indigo-700'
+    },
+    {
+      id: 'SECURITY_PDF',
+      title: lang === 'bn' ? 'PDF সিকিউরিটি' : 'PDF Security',
+      desc: lang === 'bn' ? 'Client-side lock/unlock (fallback supported)' : 'Client-side lock/unlock (fallback supported)',
+      icon: Lock,
+      gradient: 'from-emerald-600 via-teal-600 to-cyan-700'
     },
     { id: 'OCR_PDF', title: t.ocr, desc: t.ocrDesc, icon: Search, gradient: 'from-purple-500 via-violet-600 to-indigo-700' },
     { id: 'COMPRESS_PDF', title: t.compress, desc: t.compressDesc, icon: Zap, gradient: 'from-orange-500 via-amber-600 to-yellow-600' }
@@ -1200,7 +1372,7 @@ const App: React.FC = () => {
                         ref={fileInputRef} 
                         onChange={handleFileChange} 
                         multiple={activeTool === 'MERGE_PDF' || activeTool === 'IMAGE_TO_PDF'}
-                        accept={activeTool === 'IMAGE_TO_PDF' ? "image/*" : "application/pdf"} 
+                        accept={activeTool === 'IMAGE_TO_PDF' ? "image/*" : activeTool === 'SECURITY_PDF' ? '.pdf,.pnova,application/pdf' : "application/pdf"} 
                         className="hidden" 
                       />
                       <div className="relative z-10">
@@ -1382,6 +1554,26 @@ const App: React.FC = () => {
                       <h4 className="text-2xl font-black dark:text-white tracking-tight">{t.settings}</h4>
                     </div>
                     <div className="space-y-10">
+                      <div className="space-y-5">
+                        <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">
+                          {lang === 'bn' ? 'পারফরম্যান্স মোড' : 'Performance Mode'}
+                        </label>
+                        <div className="grid grid-cols-2 gap-3 p-2 bg-slate-100/50 dark:bg-slate-900/50 rounded-2xl shadow-inner">
+                          {[
+                            { id: 'BALANCED', labelBn: 'Balanced', labelEn: 'Balanced' },
+                            { id: 'MEMORY', labelBn: 'Memory', labelEn: 'Memory Saver' },
+                          ].map((mode) => (
+                            <button
+                              key={mode.id}
+                              onClick={() => setPerformanceMode(mode.id as PerformanceMode)}
+                              className={`py-3 text-[11px] font-black uppercase rounded-xl transition-all ${performanceMode === mode.id ? 'bg-white dark:bg-slate-700 shadow-md text-indigo-600 dark:text-indigo-300' : 'text-slate-400 hover:text-slate-600'}`}
+                            >
+                              {lang === 'bn' ? mode.labelBn : mode.labelEn}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
                       {activeTool === 'PDF_TO_IMAGE' && (
                         <>
                           <div className="space-y-5">
@@ -1572,6 +1764,44 @@ const App: React.FC = () => {
                         </div>
                       )}
 
+                      {activeTool === 'SECURITY_PDF' && (
+                        <div className="space-y-6">
+                          <div className="grid grid-cols-2 gap-3 p-2 bg-slate-100/50 dark:bg-slate-900/50 rounded-2xl shadow-inner">
+                            {[
+                              { id: 'UNLOCK', labelBn: 'Unlock', labelEn: 'Unlock' },
+                              { id: 'LOCK', labelBn: 'Lock', labelEn: 'Lock' },
+                            ].map((mode) => (
+                              <button
+                                key={mode.id}
+                                onClick={() => setSecurityMode(mode.id as SecurityMode)}
+                                className={`py-3 text-[11px] font-black uppercase rounded-xl transition-all ${securityMode === mode.id ? 'bg-white dark:bg-slate-700 shadow-md text-emerald-600 dark:text-emerald-300' : 'text-slate-400 hover:text-slate-600'}`}
+                              >
+                                {lang === 'bn' ? mode.labelBn : mode.labelEn}
+                              </button>
+                            ))}
+                          </div>
+
+                          <div className="space-y-3">
+                            <label className="text-[11px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] block">
+                              {lang === 'bn' ? 'পাসওয়ার্ড' : 'Password'}
+                            </label>
+                            <input
+                              type="password"
+                              value={securityPassword}
+                              onChange={(e) => setSecurityPassword(e.target.value)}
+                              placeholder={lang === 'bn' ? 'পাসওয়ার্ড লিখুন' : 'Enter password'}
+                              className="w-full bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-emerald-500 rounded-2xl p-4 font-bold text-sm text-emerald-700 dark:text-emerald-300 shadow-inner transition-all outline-none"
+                            />
+                          </div>
+
+                          <p className="text-xs font-bold text-slate-400 leading-relaxed">
+                            {lang === 'bn'
+                              ? 'Lock mode PDF কে .pnova এনক্রিপ্টেড ফরম্যাটে রাখে। Unlock mode .pnova ডিক্রিপ্ট করে PDF বানায়; password PDF unlock এ fallback image-based rebuild ব্যবহার হয়।'
+                              : 'Lock mode stores PDF as encrypted .pnova. Unlock mode decrypts .pnova back to PDF; password-PDF unlock uses an image-based fallback rebuild.'}
+                          </p>
+                        </div>
+                      )}
+
                       {activeTool === 'PAGE_TOOLS' && (
                         <div className="space-y-8">
                           <div className="space-y-5">
@@ -1748,6 +1978,7 @@ const App: React.FC = () => {
                           else if (activeTool === 'MERGE_PDF') processMergePDF();
                           else if (activeTool === 'SPLIT_PDF') processSplitPDF();
                           else if (activeTool === 'PAGE_TOOLS') processPageTools();
+                          else if (activeTool === 'SECURITY_PDF') processSecurityPDF();
                           else if (activeTool === 'COMPRESS_PDF') processCompressPDF();
                         }}
                         className={`w-full bg-gradient-to-r ${toolList.find(t => t.id === activeTool)?.gradient} text-white py-8 rounded-[3rem] font-black text-2xl shadow-2xl transition-all hover:-translate-y-2 active:scale-95 flex items-center justify-center gap-5 group/btn`}

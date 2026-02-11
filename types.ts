@@ -14,7 +14,8 @@ export type ToolType =
   | 'SPLIT_PDF'
   | 'COMPRESS_PDF'
   | 'OCR_PDF'
-  | 'PAGE_TOOLS';
+  | 'PAGE_TOOLS'
+  | 'SECURITY_PDF';
 
 export interface FileMetadata {
   name: string;
